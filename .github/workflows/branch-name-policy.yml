@@ -1,0 +1,41 @@
+name: Branch Name Policy
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+  pull_request:
+
+jobs:
+  validate-branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch naming rule
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            BRANCH_NAME="${GITHUB_HEAD_REF}"
+          else
+            BRANCH_NAME="${GITHUB_REF_NAME}"
+          fi
+
+          REGEX='^[A-Z][A-Za-z0-9]*-[A-Za-z0-9]+-devbranch$'
+
+          if [[ ! "$BRANCH_NAME" =~ $REGEX ]]; then
+            echo "Invalid branch name: '$BRANCH_NAME'"
+            echo "Required format: Firstword-Secondword-devbranch"
+            echo "Rules:"
+            echo "- First word starts with a capital letter (Name/Username)."
+            echo "- Second word is surname or word of choice."
+            echo "- Use '-' instead of spaces."
+            echo "- Branch must end with '-devbranch'."
+            echo "Allowed example: John-france-devbranch"
+            echo "Disallowed examples: john.France-branch, john france-dev"
+            exit 1
+          fi
+
+          echo "Branch name '$BRANCH_NAME' matches policy."
