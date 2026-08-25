@@ -26,20 +26,20 @@ jobs:
             BRANCH_NAME="${GITHUB_REF_NAME}"
           fi
 
-          REGEX='^[A-Z][A-Za-z0-9]*(-[A-Za-z0-9]+){1,7}-devbranch$'
+          REGEX='^[A-Z][A-Za-z0-9]*-[a-z]+(-[a-z]+){0,6}-devbranch$'
 
           if [[ ! "$BRANCH_NAME" =~ $REGEX ]]; then
             echo "Invalid branch name: '$BRANCH_NAME'"
             echo "Required format: Firstword-Secondword-...-devbranch"
             echo "Rules:"
             echo "- First word starts with a capital letter (Name/Username)."
-            echo "- Second word is surname or word of choice."
-            echo "- Words 3 through 8 are optional and can be letters/numbers."
+            echo "- Second word must be lowercase letters only."
+            echo "- Words 3 through 8 are optional and must be lowercase letters only."
             echo "- Use '-' instead of spaces."
             echo "- Maximum words before '-devbranch': 8."
             echo "- Branch must end with '-devbranch'."
-            echo "Allowed examples: John-france-devbranch, John-france-team-123-devbranch"
-            echo "Disallowed examples: john.France-branch, john france-dev"
+            echo "Allowed examples: John-france-devbranch, John-france-team-alpha-devbranch"
+            echo "Disallowed examples: John-France-devbranch, John-france-team-123-devbranch"
             exit 1
           fi
 
