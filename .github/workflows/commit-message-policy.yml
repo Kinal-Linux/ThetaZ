@@ -1,0 +1,53 @@
+name: Commit Message Policy
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-commit-messages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate commit message prefixes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REGEX='^(Fix|Feat|Docs): .+'
+
+          validate_message() {
+            local MESSAGE="$1"
+            local SHA="$2"
+            if [[ ! "$MESSAGE" =~ $REGEX ]]; then
+              echo "Invalid commit message for $SHA: $MESSAGE"
+              echo "Commit messages must start with one of: Fix:, Feat:, Docs:"
+              exit 1
+            fi
+          }
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+            while IFS='|' read -r SHA MESSAGE; do
+              validate_message "$MESSAGE" "$SHA"
+            done < <(git log --format='%H|%s' "$BASE_SHA..$HEAD_SHA")
+          else
+            SHA="${GITHUB_SHA}"
+            MESSAGE="$(git log -1 --pretty=%s "$SHA")"
+            validate_message "$MESSAGE" "$SHA"
+          fi
+
+          echo "Commit message policy passed."

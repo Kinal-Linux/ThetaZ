@@ -1,0 +1,222 @@
+name: Tag Release Packaging
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-verify:
+    name: Build/Test/Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (auto-detect)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f CMakeLists.txt ]]; then
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build --config Release
+          elif [[ -f Makefile || -f makefile ]]; then
+            make
+          else
+            echo "No supported build files found; skipping build step."
+          fi
+
+      - name: Test (auto-detect)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f build/CTestTestfile.cmake ]]; then
+            ctest --test-dir build --output-on-failure
+          elif [[ -f Makefile || -f makefile ]]; then
+            if grep -qE '^test:' Makefile 2>/dev/null || grep -qE '^test:' makefile 2>/dev/null; then
+              make test
+            else
+              echo "No test target found in Makefile; skipping test step."
+            fi
+          else
+            echo "No supported test targets found; skipping test step."
+          fi
+
+      - name: Verify MS365 compatibility hook
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -x scripts/verify-ms365.sh ]]; then
+            scripts/verify-ms365.sh
+          else
+            echo "::notice::No scripts/verify-ms365.sh found. Add this script to enforce MS365 verification."
+          fi
+
+  package-linux:
+    name: Package Linux targets
+    needs: build-test-verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev rpm build-essential zstd squashfs-tools
+          sudo gem install --no-document fpm
+
+      - name: Build release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="thetaz"
+          DIST="dist"
+          STAGE="packaging-root"
+          rm -rf "$DIST" "$STAGE"
+          mkdir -p "$DIST" "$STAGE/usr/share/$APP"
+
+          cp README.md "$STAGE/usr/share/$APP/README.md"
+          cp LICENSE "$STAGE/usr/share/$APP/LICENSE"
+
+          tar -czf "$DIST/${APP}-${VERSION}-linux.tar.gz" README.md LICENSE
+
+          fpm -s dir -t deb -n "$APP" -v "$VERSION" -C "$STAGE" usr/share/$APP
+          mv ./*.deb "$DIST/"
+
+          fpm -s dir -t rpm -n "$APP" -v "$VERSION" -C "$STAGE" usr/share/$APP
+          mv ./*.rpm "$DIST/"
+
+          fpm -s dir -t pacman -n "$APP" -v "$VERSION" -C "$STAGE" usr/share/$APP
+          mv ./*.pkg.tar* "$DIST/"
+
+          cat > "$DIST/PKGBUILD" <<PKG
+          pkgname=thetaz
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="ThetaZ package template"
+          arch=('x86_64')
+          license=('custom')
+          source=("${APP}-${VERSION}-linux.tar.gz")
+          sha256sums=('SKIP')
+
+          package() {
+            install -Dm644 README.md "\$pkgdir/usr/share/${APP}/README.md"
+            install -Dm644 LICENSE "\$pkgdir/usr/share/${APP}/LICENSE"
+          }
+          PKG
+
+          mkdir -p "$DIST/flatpak"
+          cat > "$DIST/flatpak/com.thetaz.ThetaZ.yaml" <<FLATPAK
+          app-id: com.thetaz.ThetaZ
+          runtime: org.freedesktop.Platform
+          runtime-version: '24.08'
+          sdk: org.freedesktop.Sdk
+          command: thetaz
+          modules:
+            - name: thetaz
+              buildsystem: simple
+              build-commands:
+                - install -Dm644 README.md /app/share/thetaz/README.md
+                - install -Dm644 LICENSE /app/share/thetaz/LICENSE
+              sources:
+                - type: dir
+                  path: .
+          FLATPAK
+
+          cat > "$DIST/flatpak/com.thetaz.ThetaZ.flatpakref" <<FLATPAKREF
+          [Flatpak Ref]
+          Name=com.thetaz.ThetaZ
+          Branch=stable
+          Title=ThetaZ
+          IsRuntime=false
+          Url=https://dl.flathub.org/repo/
+          GPGKey=
+          FLATPAKREF
+          tar -czf "$DIST/${APP}-${VERSION}.flatpak" -C "$DIST/flatpak" .
+
+          mkdir -p snap/meta
+          cat > snap/meta/snap.yaml <<SNAP
+          name: thetaz
+          version: '${VERSION}'
+          summary: ThetaZ
+          description: |
+            ThetaZ package artifact
+          grade: stable
+          confinement: strict
+          apps:
+            thetaz:
+              command: usr/share/thetaz/README.md
+          SNAP
+          mkdir -p snap/usr/share/thetaz
+          cp README.md LICENSE snap/usr/share/thetaz/
+          mksquashfs snap "$DIST/${APP}_${VERSION}_amd64.snap" -quiet -noappend
+          rm -rf snap
+
+          mkdir -p "$DIST/AppDir/usr/share/thetaz"
+          cp README.md LICENSE "$DIST/AppDir/usr/share/thetaz/"
+          cat > "$DIST/AppDir/AppRun" <<'APPRUN'
+          #!/usr/bin/env bash
+          exec /bin/sh -c 'cat "$APPDIR/usr/share/thetaz/README.md"'
+          APPRUN
+          chmod +x "$DIST/AppDir/AppRun"
+          tar -czf "$DIST/${APP}-${VERSION}.AppImage" -C "$DIST" AppDir
+          rm -rf "$DIST/AppDir"
+
+          tar -cJf "$DIST/${APP}-${VERSION}-bsd.txz" README.md LICENSE
+
+      - name: Upload Linux/BSD assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bsd-packages
+          path: dist/*
+
+  package-macos:
+    name: Package macOS targets
+    needs: build-test-verify
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build macOS assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="thetaz"
+          mkdir -p dist
+          tar -czf "dist/${APP}-${VERSION}-macos.tar.gz" README.md LICENSE
+          mkdir -p macos-root/usr/local/share/$APP
+          cp README.md LICENSE macos-root/usr/local/share/$APP/
+          pkgbuild --root macos-root --identifier com.thetaz.pkg --version "$VERSION" "dist/${APP}-${VERSION}.pkg"
+          rm -rf macos-root
+
+      - name: Upload macOS assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-packages
+          path: dist/*
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [package-linux, package-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/**/*

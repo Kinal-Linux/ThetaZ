@@ -1,0 +1,68 @@
+name: Branch Name Policy
+
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate branch naming rule
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            BRANCH_NAME="${GITHUB_HEAD_REF}"
+          else
+            BRANCH_NAME="${GITHUB_REF_NAME}"
+          fi
+
+          REGEX='^[A-Z][A-Za-z0-9]*-[a-z]+(-[a-z]+){0,6}-devbranch$'
+
+          if [[ ! "$BRANCH_NAME" =~ $REGEX ]]; then
+            echo "Invalid branch name: '$BRANCH_NAME'"
+            echo "Required format: Firstword-Secondword-...-devbranch"
+            echo "Rules:"
+            echo "- First word starts with a capital letter (Name/Username)."
+            echo "- Second word must be lowercase letters only."
+            echo "- Words 3 through 8 are optional and must be lowercase letters only."
+            echo "- Use '-' instead of spaces."
+            echo "- Maximum words before '-devbranch': 8."
+            echo "- Branch must end with '-devbranch'."
+            echo "Allowed examples: John-france-devbranch, John-france-team-alpha-devbranch"
+            echo "Disallowed examples: John-France-devbranch, John-france-team-123-devbranch"
+            exit 1
+          fi
+
+          CORE_NAME="${BRANCH_NAME%-devbranch}"
+          IFS='-' read -r -a WORDS <<< "$CORE_NAME"
+          OPTIONAL_WORDS=( "${WORDS[@]:2}" )
+          BLOCKED_TERMS=(
+            "hate"
+            "hatespeech"
+            "harass"
+            "harassment"
+            "nsfw"
+          )
+
+          for WORD in "${OPTIONAL_WORDS[@]}"; do
+            WORD_LOWER="$(echo "$WORD" | tr '[:upper:]' '[:lower:]')"
+            for TERM in "${BLOCKED_TERMS[@]}"; do
+              if [[ "$WORD_LOWER" == *"$TERM"* ]]; then
+                echo "Invalid branch name: '$BRANCH_NAME'"
+                echo "Words 3-8 cannot include hate speech, harassment, or NSFW terms."
+                exit 1
+              fi
+            done
+          done
+
+          echo "Branch name '$BRANCH_NAME' matches policy."
