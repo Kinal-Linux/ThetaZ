@@ -45,6 +45,22 @@ jobs:
 
           CORE_NAME="${BRANCH_NAME%-devbranch}"
           IFS='-' read -r -a WORDS <<< "$CORE_NAME"
+          FIRST_WORD="${WORDS[0]}"
+          ACTOR_ALNUM="$(echo "${GITHUB_ACTOR}" | tr -cd '[:alnum:]')"
+
+          if [[ -z "$ACTOR_ALNUM" ]]; then
+            echo "Unable to validate first word against actor username."
+            exit 1
+          fi
+
+          if [[ "${FIRST_WORD,,}" != "${ACTOR_ALNUM,,}" ]]; then
+            echo "Invalid branch name: '$BRANCH_NAME'"
+            echo "First word must match your GitHub username."
+            echo "Expected first word (alphanumeric): '$ACTOR_ALNUM'"
+            echo "Current first word: '$FIRST_WORD'"
+            exit 1
+          fi
+
           OPTIONAL_WORDS=( "${WORDS[@]:2}" )
           BLOCKED_TERMS=(
             "hate"
