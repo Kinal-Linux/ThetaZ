@@ -1,0 +1,1346 @@
+// ThetaZ — runtime kernel32 APIs (CRT / loader / file / console / sync);
+// Copyright (c) 2026 ThetaZ Project. MIT License.
+
+#include "core/api/api.h"
+#include "core/api/kernel32.h"
+#include "core/exception/exception.h"
+#include "core/loader/loader.h"
+#include "core/ipc/thetaserver.h"
+#include "core/ntdll/thread.h"
+#include "core/api/path_resolver.h"
+#include "core/x86/api_dispatch.h"
+#include "core/x86/x86.h"
+#include "core/api/window.h"
+#include "core/ntdll/virtual.h"
+#include "core/api/oleaut32.h"
+#include "core/api/crypto.h"
+#include <cwctype>
+#include <wctype.h>
+#include <fnmatch.h>
+
+struct WOW64CONTEXT;
+
+#include <cstdio>
+#include <map>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <cstdarg>
+#include <cctype>
+#include <algorithm>
+#include <ctime>
+#include <climits>
+#include <cwchar>
+#include <wctype.h>
+#include <string>
+#include <thread>
+#include <vector>
+#include <unordered_map>
+#include <memory>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <dirent.h>
+#include <errno.h>
+#include <time.h>
+#include <pthread.h>
+
+// Pull ThetaZ symbols into global scope for visibility inside namespace block
+using ThetaZ::THETAZ_GetDlgItem;
+using ThetaZ::THETAZ_SendMessageA;
+using ThetaZ::THETAZ_PostMessageA;
+using ThetaZ::THETAZ_DialogBoxParamA;
+using ThetaZ::WM_SETTEXT;
+using ThetaZ::WM_GETTEXT;
+using ThetaZ::x86_dispatch_active;
+using ThetaZ::x86_call_guest_args_ebp;
+using ThetaZ::WINAPI64_SetDlgItemTextA;
+using ThetaZ::WINAPI64_ShowWindow;
+using ThetaZ::WINAPI64_SetWindowTextA;
+using ThetaZ::WINAPI64_TranslateMessage;
+using ThetaZ::WINAPI64_UpdateWindow;
+using ThetaZ::g_window_mutex;
+using ThetaZ::find_window;
+using ThetaZ::g_x11_windows;
+using ThetaZ::g_x11_display;
+using ThetaZ::g_x11_mutex;
+using ThetaZ::ApiRegistry;
+using ThetaZ::PCONDITION_VARIABLE;
+using ThetaZ::PCRITICAL_SECTION;
+using ThetaZ::free_bstr;
+using ThetaZ::THETAZ_SysAllocString;
+using ThetaZ::THETAZ_SysAllocStringLen;
+using ThetaZ::bstr_byte_len;
+using ThetaZ::VT_BSTR;
+using ThetaZ::THETAZ_VariantCopy;
+using ThetaZ::SYSTEMTIME;
+using ThetaZ::WindowsAddressSpace;
+using ThetaZ::MemoryBasicInformation;
+using ThetaZ::MEM_RELEASE;
+using ThetaZ::MEM_DECOMMIT;
+using ThetaZ::MSG_MESSAGE;
+using ThetaZ::WM_KEYDOWN;
+using ThetaZ::WM_CHAR;
+using ThetaZ::MSG_WPARAM;
+using ThetaZ::MSG_HWND;
+using ThetaZ::bstr_byte_len;
+using ThetaZ::VT_BSTR;
+using ThetaZ::MSG_HWND;
+using ThetaZ::MSG_MESSAGE;
+using ThetaZ::MSG_WPARAM;
+using ThetaZ::WM_KEYDOWN;
+using ThetaZ::WM_CHAR;
+
+bool query_from_proc_maps(const void* addr, MemoryBasicInformation* out);
+
+namespace ThetaZ {
+
+// wstrcmpi helper for case-insensitive wide string comparison
+static inline int wstrcmpi(const uint16_t* s1, const uint16_t* s2) {
+    if (!s1 && !s2) return 0;
+    if (!s1) return -1;
+    if (!s2) return 1;
+    while (*s1 && *s2) {
+        uint16_t c1 = (*s1 >= 'A' && *s1 <= 'Z') ? *s1 + 32 : *s1;
+        uint16_t c2 = (*s2 >= 'A' && *s2 <= 'Z') ? *s2 + 32 : *s2;
+        if (c1 != c2) return c1 < c2 ? -1 : 1;
+        s1++; s2++;
+    }
+if (*s1) return 1;
+    if (*s2) return -1;
+    return 0;
+}
+
+// Forward declarations for cross-file functions
+    std::string resolve_target(const char* application, const char* commandline);
+    uint64_t alloc_child_pid();
+    std::string wchar_to_utf8(const WCHAR* s);
+
+// Forward declarations
+    void WINAPI_CALL THETAZ_AcquireSRWLockExclusive(void* SRWLock);
+    void WINAPI_CALL THETAZ_AcquireSRWLockShared(void* SRWLock);
+    PVOID WINAPI_CALL THETAZ_AddVectoredContinueHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER handler);
+    PVOID WINAPI_CALL THETAZ_AddVectoredExceptionHandler(ULONG first, PVECTORED_EXCEPTION_HANDLER handler);
+    BOOL WINAPI_CALL THETAZ_AllocConsole();
+    BOOL WINAPI_CALL THETAZ_AreFileApisANSI();
+    BOOL WINAPI_CALL THETAZ_AttachConsole(DWORD dwProcessId);
+    BOOL WINAPI_CALL THETAZ_Beep(DWORD dwFreq, DWORD dwDuration);
+    BOOL WINAPI_CALL THETAZ_BeginPaint(void* hwnd, void* ps);
+    BOOL WINAPI_CALL THETAZ_BitBlt(void* hdcDest, int x, int y, int w, int h, void* hdcSrc, int x1, int y1);
+HRESULT WINAPI_CALL THETAZ_CLSIDFromProgID(LPCOLESTR lpszProgID, LPCLSID lpclsid);
+    HRESULT WINAPI_CALL THETAZ_CLSIDFromString(LPCOLESTR lpsz, LPCLSID pclsid);
+    BOOL WINAPI_CALL THETAZ_CallNamedPipeA(LPCSTR lpNamedPipeName, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesRead, DWORD nTimeout);
+    BOOL WINAPI_CALL THETAZ_CallNamedPipeW(LPCWSTR lpNamedPipeName, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesRead, DWORD nTimeout);
+    BOOL WINAPI_CALL THETAZ_CancelIoEx(HANDLE hFile, void* lpOverlapped);
+    BOOL WINAPI_CALL THETAZ_CancelWaitableTimer(HANDLE hTimer);
+    LPCSTR WINAPI_CALL THETAZ_CharNextA(LPCSTR lpsz);
+    BOOL WINAPI_CALL THETAZ_CheckRemoteDebuggerPresent(HANDLE hProcess, PBOOL pbDebuggerPresent);
+    BOOL WINAPI_CALL THETAZ_CloseHandle(HANDLE hObject);
+    HRESULT WINAPI_CALL THETAZ_CoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext, REFIID riid, LPVOID* ppv);
+    HRESULT WINAPI_CALL THETAZ_CoGetClassObject(REFCLSID rclsid, DWORD dwClsContext, LPVOID pvReserved, REFIID riid, LPVOID* ppv);
+    HRESULT WINAPI_CALL THETAZ_CoInitialize(LPVOID pvReserved);
+    void WINAPI_CALL THETAZ_CoUninitialize();
+    INT WINAPI_CALL THETAZ_CompareStringEx(LPCWSTR lpLocaleName, DWORD dwCmpFlags, LPCWSTR lpString1, INT cchCount1, LPCWSTR lpString2, INT cchCount2, void* lpVersionInformation, void* lpReserved, void* lParam);
+    INT WINAPI_CALL THETAZ_CompareStringW(DWORD Locale, DWORD dwCmpFlags, LPCWSTR lpString1, INT cchCount1, LPCWSTR lpString2, INT cchCount2);
+    BOOL WINAPI_CALL THETAZ_CopyFileA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName, BOOL bFailIfExists);
+    BOOL WINAPI_CALL THETAZ_CopyFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, void* lpProgressRoutine, void* lpData, BOOL* pbCancel, DWORD dwCopyFlags);
+    BOOL WINAPI_CALL THETAZ_CopyFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, BOOL bFailIfExists);
+    BOOL WINAPI_CALL THETAZ_CreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes);
+    HANDLE WINAPI_CALL THETAZ_CreateEventA(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL bInitialOwner, LPCSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_CreateEventExW(LPSECURITY_ATTRIBUTES lpEventAttributes, LPCWSTR lpName, DWORD dwFlags, DWORD dwDesiredAccess);
+    HANDLE WINAPI_CALL THETAZ_CreateEventW(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL bInitialState, LPCWSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_CreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+                                          LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+                                          DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+    HANDLE WINAPI_CALL THETAZ_CreateFileMappingA(HANDLE hFile, LPSECURITY_ATTRIBUTES lpAttributes, DWORD flProtect, DWORD dwMaximumSizeHigh, DWORD dwMaximumSizeLow, LPCSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_CreateFileMappingW(HANDLE hFile, LPSECURITY_ATTRIBUTES lpAttributes, DWORD flProtect, DWORD dwMaximumSizeHigh, DWORD dwMaximumSizeLow, LPCWSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_CreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+                                          LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+                                          DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
+    HANDLE WINAPI_CALL THETAZ_CreateIoCompletionPort(HANDLE hFile, HANDLE hExistingCompletionPort, uintptr_t CompletionKey, DWORD dwNumberOfConcurrentThreads);
+    HANDLE WINAPI_CALL THETAZ_CreateMemoryResourceNotification(DWORD NotificationType);
+    HANDLE WINAPI_CALL THETAZ_CreateMutexA(LPSECURITY_ATTRIBUTES lpMutexAttributes, BOOL bInitialOwner, LPCSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_CreateMutexExW(LPSECURITY_ATTRIBUTES lpMutexAttributes, LPCWSTR lpName, DWORD dwFlags, DWORD dwDesiredAccess);
+    HANDLE WINAPI_CALL THETAZ_CreateMutexW(LPSECURITY_ATTRIBUTES lpMutexAttributes, BOOL bInitialOwner, LPCWSTR lpName);
+    BOOL WINAPI_CALL THETAZ_CreateNamedPipeA(LPCSTR lpName, DWORD dwOpenMode, DWORD dwPipeMode, DWORD nMaxInstances,
+                                              DWORD nOutBufferSize, DWORD nInBufferSize, DWORD nDefaultTimeOut,
+                                              LPSECURITY_ATTRIBUTES lpSecurityAttributes);
+    BOOL WINAPI_CALL THETAZ_CreateNamedPipeW(LPCWSTR lpName, DWORD dwOpenMode, DWORD dwPipeMode, DWORD nMaxInstances,
+                                              DWORD nOutBufferSize, DWORD nInBufferSize, DWORD nDefaultTimeOut,
+                                              LPSECURITY_ATTRIBUTES lpSecurityAttributes);
+    HANDLE WINAPI_CALL THETAZ_CreateSemaphoreA(LPSECURITY_ATTRIBUTES lpSemaphoreAttributes, LONG lInitialCount, LONG lMaximumCount, LPCSTR lpName);
+    BOOL WINAPI_CALL THETAZ_CreateSymbolicLinkW(LPCWSTR lpSymlinkFileName, LPCWSTR lpTargetFileName, DWORD dwFlags);
+    HANDLE WINAPI_CALL THETAZ_CreateThread(LPSECURITY_ATTRIBUTES lpThreadAttributes, SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId);
+    HANDLE WINAPI_CALL THETAZ_CreateTimerQueue();
+    BOOL WINAPI_CALL THETAZ_CreateTimerQueueTimer(HANDLE* phNewTimer, HANDLE TimerQueue, void* Callback, void* Parameter, DWORD DueTime, DWORD Period, ULONG Flags);
+    HANDLE WINAPI_CALL THETAZ_CreateWaitableTimerW(LPSECURITY_ATTRIBUTES lpTimerAttributes, BOOL bManualReset, LPCWSTR lpTimerName);
+    LPVOID WINAPI_CALL THETAZ_DecodePointer(LPCVOID Ptr);
+    void WINAPI_CALL THETAZ_DeleteConditionVariable(PCONDITION_VARIABLE ConditionVariable);
+    void WINAPI_CALL THETAZ_DeleteCriticalSection(PCRITICAL_SECTION lpCriticalSection);
+    BOOL WINAPI_CALL THETAZ_DeleteDC(void* hdc);
+    BOOL WINAPI_CALL THETAZ_DeleteFileA(LPCSTR lpFileName);
+    BOOL WINAPI_CALL THETAZ_DeleteFileW(LPCWSTR lpFileName);
+    BOOL WINAPI_CALL THETAZ_DeleteObject(void* hobj);
+    BOOL WINAPI_CALL THETAZ_DeleteTimerQueue(HANDLE TimerQueue);
+    BOOL WINAPI_CALL THETAZ_DeleteTimerQueueTimer(HANDLE TimerQueue, HANDLE Timer, HANDLE CompletionEvent);
+    BOOL WINAPI_CALL THETAZ_DeviceIoControl(HANDLE hDevice, DWORD dwIoControlCode, void* lpInBuffer, DWORD nInBufferSize, void* lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, void* lpOverlapped);
+    BOOL WINAPI_CALL THETAZ_DisableThreadLibraryCalls(HMODULE hModule);
+    BOOL WINAPI_CALL THETAZ_DuplicateHandle(HANDLE hSourceProcessHandle, HANDLE hSourceHandle, HANDLE hTargetProcessHandle, HANDLE* lpTargetHandle, DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwOptions);
+    BOOL WINAPI_CALL THETAZ_EnableMenuItem(HMENU hMenu, UINT uIDEnableItem, UINT uEnable);
+    LPVOID WINAPI_CALL THETAZ_EncodePointer(LPCVOID Ptr);
+    BOOL WINAPI_CALL THETAZ_EndPaint(void* hwnd, void* ps);
+    void WINAPI_CALL THETAZ_EnterCriticalSection(PCRITICAL_SECTION lpCriticalSection);
+    BOOL WINAPI_CALL THETAZ_EnumSystemLocalesEx(LOCALE_ENUMPROCEX lpLocaleEnumProcEx, DWORD dwFlags, uintptr_t lParam, void* lpReserved);
+    BOOL WINAPI_CALL THETAZ_EnumSystemLocalesW(LOCALE_ENUMPROCW lpLocaleEnumProc, DWORD dwFlags);
+    void WINAPI_CALL THETAZ_ExitProcess(uint32_t exit_code);
+    void WINAPI_CALL THETAZ_ExitThread(DWORD dwExitCode);
+    DWORD WINAPI_CALL THETAZ_ExpandEnvironmentStringsW(LPCWSTR lpSrc, LPWSTR lpDst, DWORD nSize);
+    BOOL WINAPI_CALL THETAZ_FileTimeToSystemTime(const FILETIME* lpFileTime, SYSTEMTIME* lpSystemTime);
+    BOOL WINAPI_CALL THETAZ_FindClose(HANDLE hFindFile);
+    HANDLE WINAPI_CALL THETAZ_FindFirstFileA(LPCSTR lpFileName, void* lpFindFileData);
+    HANDLE WINAPI_CALL THETAZ_FindFirstFileExW(LPCWSTR lpFileName, void* fInfoLevelId, WIN32_FIND_DATAW* lpFindFileData, void* fSearchOp, void* lpSearchFilter, DWORD dwAdditionalFlags);
+    HANDLE WINAPI_CALL THETAZ_FindFirstFileW(LPCWSTR lpFileName, WIN32_FIND_DATAW* lpFindFileData);
+    BOOL WINAPI_CALL THETAZ_FindNextFileA(HANDLE hFindFile, void* lpFindFileData);
+    BOOL WINAPI_CALL THETAZ_FindNextFileW(HANDLE hFindFile, WIN32_FIND_DATAW* lpFindFileData);
+    DWORD WINAPI_CALL THETAZ_FlsAlloc(void* lpCallback);
+    BOOL WINAPI_CALL THETAZ_FlsFree(DWORD dwFlsIndex);
+    LPVOID WINAPI_CALL THETAZ_FlsGetValue(DWORD dwFlsIndex);
+    BOOL WINAPI_CALL THETAZ_FlsSetValue(DWORD dwFlsIndex, LPVOID lpFlsData);
+    BOOL WINAPI_CALL THETAZ_FlushFileBuffers(HANDLE hFile);
+    BOOL WINAPI_CALL THETAZ_FlushViewOfFile(LPCVOID lpBaseAddress, SIZE_T dwNumberOfBytesToFlush);
+    DWORD WINAPI_CALL THETAZ_FormatMessageA(DWORD dwFlags, LPCVOID lpSource, DWORD dwMessageId, DWORD dwLanguageId, LPSTR lpBuffer, DWORD nSize, void* Arguments);
+    DWORD WINAPI_CALL THETAZ_FormatMessageW(DWORD dwFlags, LPCVOID lpSource, DWORD dwMessageId, DWORD dwLanguageId, LPWSTR lpBuffer, DWORD nSize, void* Arguments);
+    BOOL WINAPI_CALL THETAZ_FreeConsole();
+    BOOL WINAPI_CALL THETAZ_FreeEnvironmentStringsA(LPSTR lpszEnvironmentBlock);
+    BOOL WINAPI_CALL THETAZ_FreeEnvironmentStringsW(LPWSTR lpszEnvironmentBlock);
+    BOOL WINAPI_CALL THETAZ_FreeLibrary(HMODULE hLibModule);
+    void WINAPI_CALL THETAZ_FreeLibraryAndExitThread(HMODULE hLibModule, DWORD dwExitCode);
+    BOOL WINAPI_CALL THETAZ_FreeResource(void* hResData);
+    DWORD WINAPI_CALL THETAZ_GetACP();
+    int WINAPI_CALL THETAZ_GetAddrInfoW(const wchar_t* pNodeName, const wchar_t* pServiceName, const void* pHints, void** ppResult);
+    BOOL WINAPI_CALL THETAZ_GetCPInfo(UINT CodePageID, CPINFO* lpCPInfo);
+    BOOL WINAPI_CALL THETAZ_GetCPInfoExW(UINT CodePageID, DWORD dwFlags, CPINFOEXW* lpCPInfoEx);
+    BOOL WINAPI_CALL THETAZ_GetClassInfoW(HINSTANCE hInstance, LPCWSTR lpClassName, LPWNDCLASSW lpWndClass);
+    DWORD WINAPI_CALL THETAZ_GetClassLongPtrW(HWND hWnd, int nIndex);
+    BOOL WINAPI_CALL THETAZ_GetClientRect(void* hwnd, void* rect);
+    LPSTR WINAPI_CALL THETAZ_GetCommandLineA();
+    LPWSTR WINAPI_CALL THETAZ_GetCommandLineW();
+    BOOL WINAPI_CALL THETAZ_GetComputerNameExW(COMPUTER_NAME_FORMAT NameType, LPWSTR lpBuffer, LPDWORD nSize);
+    BOOL WINAPI_CALL THETAZ_GetComputerNameW(LPWSTR lpBuffer, LPDWORD nSize);
+    UINT WINAPI_CALL THETAZ_GetConsoleCP();
+    BOOL WINAPI_CALL THETAZ_GetConsoleMode(HANDLE hConsoleHandle, LPDWORD lpMode);
+    UINT WINAPI_CALL THETAZ_GetConsoleOutputCP();
+    DWORD WINAPI_CALL THETAZ_GetCurrentDirectoryA(DWORD nBufferLength, LPSTR lpBuffer);
+    DWORD WINAPI_CALL THETAZ_GetCurrentDirectoryW(DWORD nBufferLength, LPWSTR lpBuffer);
+    HANDLE WINAPI_CALL THETAZ_GetCurrentProcess();
+    DWORD WINAPI_CALL THETAZ_GetCurrentProcessId();
+    HANDLE WINAPI_CALL THETAZ_GetCurrentThread();
+    DWORD WINAPI_CALL THETAZ_GetCurrentThreadId();
+    INT WINAPI_CALL THETAZ_GetDateFormatEx(LPCWSTR lpLocaleName, DWORD dwFlags, const SYSTEMTIME* lpDate, LPCWSTR lpFormat, LPWSTR lpDateStr, INT cchDate, void* lpCalendar);
+    INT WINAPI_CALL THETAZ_GetDateFormatW(DWORD Locale, DWORD dwFlags, const SYSTEMTIME* lpDate, LPCWSTR lpFormat, LPWSTR lpDateStr, INT cchDate);
+    int WINAPI_CALL THETAZ_GetDeviceCaps(void* hdc, int index);
+    BOOL WINAPI_CALL THETAZ_GetDiskFreeSpaceA(LPCSTR lpRootPathName, LPDWORD lpSectorsPerCluster, LPDWORD lpBytesPerSector, LPDWORD lpNumberOfFreeClusters, LPDWORD lpTotalNumberOfClusters);
+    BOOL WINAPI_CALL THETAZ_GetDiskFreeSpaceExW(LPCWSTR lpDirectoryName, ULARGE_INTEGER* lpFreeBytesAvailableToCaller, ULARGE_INTEGER* lpTotalNumberOfBytes, ULARGE_INTEGER* lpTotalNumberOfFreeBytes);
+    BOOL WINAPI_CALL THETAZ_GetDiskFreeSpaceW(LPCWSTR lpRootPathName, LPDWORD lpSectorsPerCluster, LPDWORD lpBytesPerSector, LPDWORD lpNumberOfFreeClusters, LPDWORD lpTotalNumberOfClusters);
+    UINT WINAPI_CALL THETAZ_GetDriveTypeA(LPCSTR lpRootPathName);
+    UINT WINAPI_CALL THETAZ_GetDriveTypeW(LPCWSTR lpRootPathName);
+    DWORD WINAPI_CALL THETAZ_GetEnvironmentVariableA(LPCSTR lpName, LPSTR lpBuffer, DWORD nSize);
+    DWORD WINAPI_CALL THETAZ_GetEnvironmentVariableW(LPCWSTR lpName, LPWSTR lpBuffer, DWORD nSize);
+    BOOL WINAPI_CALL THETAZ_GetExitCodeProcess(HANDLE process, DWORD* code);
+    DWORD WINAPI_CALL THETAZ_GetExitCodeThread(HANDLE hThread, LPDWORD lpExitCode);
+    DWORD WINAPI_CALL THETAZ_GetFileAttributesA(LPCSTR lpFileName);
+    BOOL WINAPI_CALL THETAZ_GetFileAttributesExW(LPCWSTR lpFileName, DWORD fInfoLevelId, void* lpFileInformation);
+    DWORD WINAPI_CALL THETAZ_GetFileAttributesW(LPCWSTR lpFileName);
+    BOOL WINAPI_CALL THETAZ_GetFileInformationByHandle(HANDLE hFile, BY_HANDLE_FILE_INFORMATION* lpFileInformation);
+    BOOL WINAPI_CALL THETAZ_GetFileInformationByHandleEx(HANDLE hFile, DWORD FileInformationClass, void* lpFileInformation, DWORD dwBufferSize);
+    DWORD WINAPI_CALL THETAZ_GetFileSize(HANDLE hFile, LPDWORD lpFileSizeHigh);
+    BOOL WINAPI_CALL THETAZ_GetFileSizeEx(HANDLE hFile, void* lpFileSize);
+    BOOL WINAPI_CALL THETAZ_GetFileTime(HANDLE hFile, FILETIME* lpCreationTime, FILETIME* lpLastAccessTime, FILETIME* lpLastWriteTime);
+    DWORD WINAPI_CALL THETAZ_GetFileType(HANDLE hFile);
+    DWORD WINAPI_CALL THETAZ_GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath, DWORD cchFilePath, DWORD dwFlags);
+    DWORD WINAPI_CALL THETAZ_GetFullPathNameA(LPCSTR lpFileName, DWORD nBufferLength, LPSTR lpBuffer, LPSTR* lpFilePart);
+    DWORD WINAPI_CALL THETAZ_GetFullPathNameW(LPCWSTR lpFileName, DWORD nBufferLength, LPWSTR lpBuffer, LPWSTR* lpFilePart);
+    DWORD WINAPI_CALL THETAZ_GetLastError();
+    void WINAPI_CALL THETAZ_GetLocalTime(void* lpSystemTime);
+    INT WINAPI_CALL THETAZ_GetLocaleInfoA(DWORD Locale, DWORD LCType, LPSTR lpLCData, INT cchData);
+    INT WINAPI_CALL THETAZ_GetLocaleInfoEx(LPCWSTR lpLocaleName, DWORD LCType, LPWSTR lpLCData, INT cchData);
+    INT WINAPI_CALL THETAZ_GetLocaleInfoW(DWORD Locale, DWORD LCType, LPWSTR lpLCData, INT cchData);
+    BOOL WINAPI_CALL THETAZ_GetLogicalProcessorInformation(SYSTEM_LOGICAL_PROCESSOR_INFORMATION* Buffer, DWORD* ReturnedLength);
+    DWORD WINAPI_CALL THETAZ_GetLongPathNameW(LPCWSTR lpszShortPath, LPWSTR lpszLongPath, DWORD cchBuffer);
+    BOOL WINAPI_CALL THETAZ_GetMenuItemInfoW(HWND hMenu, UINT item, BOOL fByPosition, void* lpmii);
+    DWORD WINAPI_CALL THETAZ_GetModuleFileNameA(HMODULE hModule, LPSTR lpFilename, DWORD nSize);
+    DWORD WINAPI_CALL THETAZ_GetModuleFileNameW(HMODULE hModule, LPWSTR lpFilename, DWORD nSize);
+    HMODULE WINAPI_CALL THETAZ_GetModuleHandleA(LPCSTR lpModuleName);
+    BOOL WINAPI_CALL THETAZ_GetModuleHandleExW(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE* phModule);
+    HMODULE WINAPI_CALL THETAZ_GetModuleHandleW(LPCWSTR lpModuleName);
+    int WINAPI_CALL THETAZ_GetNameInfoW(const SOCKADDR* pSockaddr, size_t SockaddrLength, PWCHAR pNodeBuffer, DWORD NodeBufferSize, PWCHAR pServiceBuffer, DWORD ServiceBufferSize, INT Flags);
+    BOOL WINAPI_CALL THETAZ_GetNamedPipeInfo(HANDLE hNamedPipe, LPDWORD lpFlags, LPDWORD lpOutBufferSize, LPDWORD lpInBufferSize, LPDWORD lpNumberOfInstances);
+    void WINAPI_CALL THETAZ_GetNativeSystemInfo(void* lpSystemInfo);
+    BOOL WINAPI_CALL THETAZ_GetNumberOfConsoleInputEvents(HANDLE hConsoleInput, LPDWORD lpNumberOfEvents);
+    DWORD WINAPI_CALL THETAZ_GetOEMCP();
+    BOOL WINAPI_CALL THETAZ_GetOverlappedResult(HANDLE hFile, void* lpOverlapped, LPDWORD lpNumberOfBytesTransferred, BOOL bWait);
+    BOOL WINAPI_CALL THETAZ_GetPhysicallyInstalledSystemMemory(uint64_t* TotalBytesInKilobytes);
+    DWORD WINAPI_CALL THETAZ_GetPriorityClass(HANDLE hProcess);
+    BOOL WINAPI_CALL THETAZ_GetProcessAffinityMask(HANDLE hProcess, DWORD* lpProcessAffinityMask, DWORD* lpSystemAffinityMask);
+    DWORD WINAPI_CALL THETAZ_GetProcessHandleCount(HANDLE hProcess, DWORD* pdwHandleCount);
+    HANDLE WINAPI_CALL THETAZ_GetProcessHeap();
+    DWORD WINAPI_CALL THETAZ_GetProcessId(HANDLE hProcess);
+    BOOL WINAPI_CALL THETAZ_GetProcessTimes(HANDLE hProcess, FILETIME* lpCreationTime, FILETIME* lpExitTime, FILETIME* lpKernelTime, FILETIME* lpUserTime);
+    BOOL WINAPI_CALL THETAZ_GetProductInfo(DWORD dwOSMajorVersion, DWORD dwOSMinorVersion, DWORD dwSpMajorVersion, DWORD dwSpMinorVersion, DWORD* pdwReturnedProductType);
+    HANDLE WINAPI_CALL THETAZ_GetPropA(HWND hWnd, LPCSTR lpString);
+    BOOL WINAPI_CALL THETAZ_GetQueuedCompletionStatus(HANDLE CompletionPort, LPDWORD lpNumberOfBytesTransferred, uintptr_t* lpCompletionKey, void** lpOverlapped, DWORD dwMilliseconds);
+    BOOL WINAPI_CALL THETAZ_GetSecurityDescriptorDacl(PSECURITY_DESCRIPTOR pSecurityDescriptor, LPBOOL lpbDaclPresent, PACL* pDacl, LPBOOL lpbDaclDefaulted);
+    DWORD WINAPI_CALL THETAZ_GetShortPathNameA(LPCSTR lpszLongPath, LPSTR lpszShortPath, DWORD cchBuffer);
+    void WINAPI_CALL THETAZ_GetStartupInfoA(void* lpStartupInfo);
+    void WINAPI_CALL THETAZ_GetStartupInfoW(void* lpStartupInfo);
+    HANDLE WINAPI_CALL THETAZ_GetStdHandle(DWORD nStdHandle);
+    BOOL WINAPI_CALL THETAZ_GetStringTypeExA(DWORD Locale, DWORD dwInfoType, LPCSTR lpSrcStr, INT cchSrc, WORD* lpCharType);
+    BOOL WINAPI_CALL THETAZ_GetStringTypeExW(DWORD Locale, DWORD dwInfoType, LPCWSTR lpSrcStr, INT cchSrc, WORD* lpCharType);
+    BOOL WINAPI_CALL THETAZ_GetStringTypeW(DWORD dwInfoType, LPCWSTR lpSrcStr, INT cchSrc, WORD* lpCharType);
+    DWORD WINAPI_CALL THETAZ_GetSystemDefaultLCID();
+    INT WINAPI_CALL THETAZ_GetSystemDefaultLocaleName(LPWSTR lpLocaleName, INT cchLocaleName);
+    UINT WINAPI_CALL THETAZ_GetSystemDirectoryW(LPWSTR lpBuffer, UINT uSize);
+    void WINAPI_CALL THETAZ_GetSystemInfo(void* lpSystemInfo);
+    int WINAPI_CALL THETAZ_GetSystemMetrics(int index);
+    BOOL WINAPI_CALL THETAZ_GetSystemPowerStatus(SYSTEM_POWER_STATUS* lpSystemPowerStatus);
+    BOOL WINAPI_CALL THETAZ_GetSystemPreferredUILanguages(DWORD dwFlags, DWORD* pulNumLanguages, LPWSTR pwszLanguagesBuffer, DWORD* pcchLanguagesBuffer);
+    void WINAPI_CALL THETAZ_GetSystemTime(void* lpSystemTime);
+    void WINAPI_CALL THETAZ_GetSystemTimeAsFileTime(void* lpSystemTimeAsFileTime);
+    INT WINAPI_CALL THETAZ_GetSystemTimePreciseAsFileTime(void* lpFileTime);
+    UINT WINAPI_CALL THETAZ_GetTempFileNameW(LPCWSTR lpPathName, LPCWSTR lpPrefixString, UINT uUnique, LPWSTR lpTempFileName);
+    DWORD WINAPI_CALL THETAZ_GetTempPathA(DWORD nBufferLength, LPSTR lpBuffer);
+    DWORD WINAPI_CALL THETAZ_GetTempPathW(DWORD nBufferLength, LPWSTR lpBuffer);
+    BOOL WINAPI_CALL THETAZ_GetThreadIOPendingFlag(HANDLE hThread, PBOOL lpIOIsPending);
+    DWORD WINAPI_CALL THETAZ_GetThreadId(HANDLE hThread);
+    DWORD WINAPI_CALL THETAZ_GetThreadLocale();
+    BOOL WINAPI_CALL THETAZ_GetThreadTimes(HANDLE hThread, FILETIME* lpCreationTime, FILETIME* lpExitTime, FILETIME* lpKernelTime, FILETIME* lpUserTime);
+    DWORD WINAPI_CALL THETAZ_GetTickCount();
+    INT WINAPI_CALL THETAZ_GetTimeFormatEx(LPCWSTR lpLocaleName, DWORD dwFlags, const SYSTEMTIME* lpTime, LPCWSTR lpFormat, LPWSTR lpTimeStr, INT cchTime, void* lpCalendar);
+    INT WINAPI_CALL THETAZ_GetTimeFormatW(DWORD Locale, DWORD dwFlags, const SYSTEMTIME* lpTime, LPCWSTR lpFormat, LPWSTR lpTimeStr, INT cchTime);
+    DWORD WINAPI_CALL THETAZ_GetTimeZoneInformation(TIME_ZONE_INFORMATION* lpTimeZoneInformation);
+    DWORD WINAPI_CALL THETAZ_GetUserDefaultLCID();
+    INT WINAPI_CALL THETAZ_GetUserDefaultLocaleName(LPWSTR lpLocaleName, INT cchLocaleName);
+    DWORD WINAPI_CALL THETAZ_GetUserGeoID(DWORD GeoClass);
+    BOOL WINAPI_CALL THETAZ_GetUserPreferredUILanguages(DWORD dwFlags, DWORD* pulNumLanguages, LPWSTR pwszLanguagesBuffer, DWORD* pcchLanguagesBuffer);
+    BOOL WINAPI_CALL THETAZ_GetVersionExA(void* lpVersionInformation);
+    BOOL WINAPI_CALL THETAZ_GetVersionExW(void* lpVersionInformation);
+    BOOL WINAPI_CALL THETAZ_GetVolumeInformationW(LPCWSTR lpRootPathName, LPWSTR lpVolumeNameBuffer, DWORD nVolumeNameSize, LPDWORD lpVolumeSerialNumber, LPDWORD lpMaximumComponentLength, LPDWORD lpFileSystemFlags, LPWSTR lpFileSystemNameBuffer, DWORD nFileSystemNameSize);
+    BOOL WINAPI_CALL THETAZ_GetVolumeNameForVolumeMountPointW(LPCWSTR lpszVolumeMountPoint, LPWSTR lpszVolumeName, DWORD cchBufferLength);
+    BOOL WINAPI_CALL THETAZ_GetVolumePathNameW(LPCWSTR lpszFileName, LPWSTR lpszVolumePathName, DWORD cchBufferLength);
+    BOOL WINAPI_CALL THETAZ_GetVolumePathNamesForVolumeNameW(LPCWSTR lpszVolumeName, LPWSTR lpszVolumePathNames, DWORD cchBufferLength, PDWORD lpcchReturnLength);
+    LPVOID WINAPI_CALL THETAZ_GlobalAlloc(UINT uFlags, SIZE_T dwBytes);
+    LPVOID WINAPI_CALL THETAZ_GlobalFree(LPVOID hMem);
+    BOOL WINAPI_CALL THETAZ_GlobalMemoryStatusEx(MEMORYSTATUSEX* lpBuffer);
+    LPVOID WINAPI_CALL THETAZ_GlobalReAlloc(LPVOID hMem, SIZE_T dwBytes, UINT uFlags);
+    SIZE_T WINAPI_CALL THETAZ_GlobalSize(LPVOID hMem);
+    SIZE_T WINAPI_CALL THETAZ_HeapCompact(HANDLE hHeap, DWORD dwFlags);
+    HANDLE WINAPI_CALL THETAZ_HeapCreate(DWORD flOptions, SIZE_T dwInitialSize, SIZE_T dwMaximumSize);
+    BOOL WINAPI_CALL THETAZ_HeapDestroy(HANDLE hHeap);
+    BOOL WINAPI_CALL THETAZ_HeapFree(HANDLE hHeap, DWORD dwFlags, void* lpMem);
+    BOOL WINAPI_CALL THETAZ_HeapSetInformation(HANDLE hHeap, void* HeapInformationClass, void* HeapInformation, SIZE_T HeapInformationLength);
+    SIZE_T WINAPI_CALL THETAZ_HeapSize(HANDLE hHeap, DWORD dwFlags, LPCVOID lpMem);
+    BOOL WINAPI_CALL THETAZ_HeapValidate(HANDLE hHeap, DWORD dwFlags, LPCVOID lpMem);
+    BOOL WINAPI_CALL THETAZ_HeapWalk(HANDLE hHeap, void* lpEntry);
+    BOOL WINAPI_CALL THETAZ_ImmDisableIME(DWORD id);
+    void WINAPI_CALL THETAZ_InitConditionVariable(PCONDITION_VARIABLE ConditionVariable);
+    BOOL WINAPI_CALL THETAZ_InitOnceBeginInitialize(void* lpInitOnce, DWORD dwFlags, BOOL* fPending, LPVOID* lpContext);
+    BOOL WINAPI_CALL THETAZ_InitOnceComplete(void* lpInitOnce, DWORD dwFlags, LPVOID lpContext);
+    BOOL WINAPI_CALL THETAZ_InitOnceExecuteOnce(void* lpInitOnce, void* InitOnceCallback, void* Parameter, LPVOID* lpContext);
+    void WINAPI_CALL THETAZ_InitializeConditionVariable(void* lpConditionVariable);
+    void WINAPI_CALL THETAZ_InitializeCriticalSection(PCRITICAL_SECTION lpCriticalSection);
+    BOOL WINAPI_CALL THETAZ_InitializeCriticalSectionAndSpinCount(PCRITICAL_SECTION lpCriticalSection, DWORD dwSpinCount);
+    BOOL WINAPI_CALL THETAZ_InitializeCriticalSectionEx(PCRITICAL_SECTION lpCriticalSection, DWORD dwSpinCount, DWORD Flags);
+    void WINAPI_CALL THETAZ_InitializeSListHead(void* ListHead);
+    BOOL WINAPI_CALL THETAZ_InitializeSRWLock(PSRWLOCK SRWLock);
+    BOOL WINAPI_CALL THETAZ_IsBadStringPtrW(LPCWSTR lpsz, UINT_PTR ucchMax);
+    BOOL WINAPI_CALL THETAZ_IsDBCSLeadByte(BYTE TestChar);
+    BOOL WINAPI_CALL THETAZ_IsDebuggerPresent();
+    BOOL WINAPI_CALL THETAZ_IsProcessorFeaturePresent(DWORD ProcessorFeature);
+    BOOL WINAPI_CALL THETAZ_IsSystemResumeAutomatic();
+    BOOL WINAPI_CALL THETAZ_IsValidCodePage(UINT CodePageID);
+    BOOL WINAPI_CALL THETAZ_IsValidLocale(DWORD Locale, DWORD dwFlags);
+    BOOL WINAPI_CALL THETAZ_IsValidLocaleName(LPCWSTR lpLocaleName);
+    INT WINAPI_CALL THETAZ_LCIDToLocaleName(DWORD Locale, LPWSTR lpName, INT cchName, DWORD dwFlags);
+    INT WINAPI_CALL THETAZ_LCMapStringEx(LPCWSTR lpLocaleName, DWORD dwMapFlags, LPCWSTR lpSrcStr, INT cchSrc, LPWSTR lpDestStr, INT cchDest, void* lpVersionInformation, void* lpReserved, void* lParam);
+    INT WINAPI_CALL THETAZ_LCMapStringW(DWORD Locale, DWORD dwMapFlags, LPCWSTR lpSrcStr, INT cchSrc, LPWSTR lpDestStr, INT cchDest);
+    void WINAPI_CALL THETAZ_LeaveCriticalSection(PCRITICAL_SECTION lpCriticalSection);
+    HMODULE WINAPI_CALL THETAZ_LoadLibraryA(LPCSTR lpLibFileName);
+    HMODULE WINAPI_CALL THETAZ_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags);
+    HMODULE WINAPI_CALL THETAZ_LoadLibraryW(LPCWSTR lpLibFileName);
+    int WINAPI_CALL THETAZ_LoadStringA(HINSTANCE hInstance, UINT uID, LPSTR lpBuffer, int cchBufferMax);
+    LPVOID WINAPI_CALL THETAZ_LocalAlloc(UINT uFlags, SIZE_T uBytes);
+    LPVOID WINAPI_CALL THETAZ_LocalFree(LPVOID hMem);
+    LPVOID WINAPI_CALL THETAZ_LocalReAlloc(LPVOID hMem, SIZE_T uBytes, UINT uFlags);
+    SIZE_T WINAPI_CALL THETAZ_LocalSize(LPVOID hMem);
+    DWORD WINAPI_CALL THETAZ_LocaleNameToLCID(LPCWSTR lpName, DWORD dwFlags);
+    BOOL WINAPI_CALL THETAZ_LockFile(HANDLE hFile, DWORD dwFileOffsetLow, DWORD dwFileOffsetHigh, DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh);
+    BOOL WINAPI_CALL THETAZ_LockFileEx(HANDLE hFile, DWORD dwFlags, DWORD dwReserved, DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh, void* lpOverlapped);
+    LPVOID WINAPI_CALL THETAZ_LockResource(void* hResData);
+    ULONG WINAPI_CALL THETAZ_LsaNtStatusToWinError(void* status);
+    LPVOID WINAPI_CALL THETAZ_MapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess, DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow, SIZE_T dwNumberOfBytesToMap);
+    HMONITOR WINAPI_CALL THETAZ_MonitorFromPoint(POINT pt, DWORD dwFlags);
+    HMONITOR WINAPI_CALL THETAZ_MonitorFromWindow(HWND hwnd, DWORD dwFlags);
+    BOOL WINAPI_CALL THETAZ_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags);
+    DWORD WINAPI_CALL THETAZ_MsgWaitForMultipleObjectsEx(DWORD nCount, const HANDLE* pHandles, DWORD dwMilliseconds, DWORD dwWakeMask, DWORD dwFlags);
+    INT WINAPI_CALL THETAZ_MulDiv(INT nNumber, INT nNumerator, INT nDenominator);
+    INT WINAPI_CALL THETAZ_MultiByteToWideChar(UINT CodePage, DWORD dwFlags, LPCSTR lpMultiByteStr, int cbMultiByte,
+                                           LPWSTR lpWideCharStr, int cchWideChar);
+    LONG WINAPI_CALL THETAZ_NtQueryInformationProcess(HANDLE processHandle, PROCESSINFOCLASS processInformationClass,
+                                                   PVOID processInformation, ULONG processInformationLength,
+                                                   PULONG returnLength);
+    LONG WINAPI_CALL THETAZ_NtQueryInformationThread(HANDLE threadHandle, THREADINFOCLASS threadInformationClass,
+                                                  PVOID threadInformation, ULONG threadInformationLength,
+                                                  PULONG returnLength);
+    HRESULT WINAPI_CALL THETAZ_OleInitialize(LPVOID pvReserved);
+    void WINAPI_CALL THETAZ_OleUninitialize();
+    HANDLE WINAPI_CALL THETAZ_OpenEventA(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_OpenEventW(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCWSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_OpenFileMappingA(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_OpenMutexA(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_OpenMutexW(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCWSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
+    HANDLE WINAPI_CALL THETAZ_OpenSemaphoreA(DWORD dwDesiredAccess, BOOL bInheritHandle, LPCSTR lpName);
+    HANDLE WINAPI_CALL THETAZ_OpenThread(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwThreadId);
+    void WINAPI_CALL THETAZ_OutputDebugStringA(LPCSTR lpOutputString);
+    void WINAPI_CALL THETAZ_OutputDebugStringW(LPCWSTR lpOutputString);
+    BOOL WINAPI_CALL THETAZ_PeekNamedPipe(HANDLE hNamedPipe, LPVOID lpBuffer, DWORD nBufferSize, LPDWORD lpBytesRead, LPDWORD lpTotalBytesAvail, LPDWORD lpBytesLeftThisMessage);
+    BOOL WINAPI_CALL THETAZ_PostQueuedCompletionStatus(HANDLE CompletionPort, DWORD dwNumberOfBytesTransferred, uintptr_t dwCompletionKey, void* lpOverlapped);
+    BOOL WINAPI_CALL THETAZ_ProcessIdToSessionId(DWORD dwProcessId, DWORD* pSessionId);
+    BOOL WINAPI_CALL THETAZ_PulseEvent(HANDLE hEvent);
+    WORD WINAPI_CALL THETAZ_QueryDepthSList(void* ListHead);
+    BOOL WINAPI_CALL THETAZ_QueryFullProcessImageNameW(HANDLE hProcess, DWORD dwFlags, LPWSTR lpExeName, PDWORD lpdwSize);
+    BOOL WINAPI_CALL THETAZ_QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount);
+    BOOL WINAPI_CALL THETAZ_QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency);
+    BOOL WINAPI_CALL THETAZ_QueryProcessCycleTime(HANDLE hProcess, uint64_t* CycleTime);
+    BOOL WINAPI_CALL THETAZ_QueryThreadCycleTime(HANDLE hThread, uint64_t* CycleTime);
+    BOOL WINAPI_CALL THETAZ_QueryUnbiasedInterruptTime(uint64_t* lpUnbiasedInterruptTime);
+    void WINAPI_CALL THETAZ_RaiseException(DWORD dwExceptionCode, DWORD dwExceptionFlags, DWORD nNumberOfArguments, void* lpArguments);
+    BOOL WINAPI_CALL THETAZ_ReadConsoleW(HANDLE hConsoleInput, LPVOID lpBuffer, DWORD nNumberOfCharsToRead,
+                                      LPDWORD lpNumberOfCharsRead, PCONSOLE_READCONSOLE_CONTROL lpConsoleReadControl);
+    BOOL WINAPI_CALL THETAZ_ReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead,
+                                  LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped);
+    BOOL WINAPI_CALL THETAZ_ReadProcessMemory(HANDLE hProcess, LPCVOID lpBaseAddress, LPVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead);
+    BOOL WINAPI_CALL THETAZ_RegCloseKey(HKEY hKey);
+    LONG WINAPI_CALL THETAZ_RegCreateKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD Reserved, LPSTR lpClass, DWORD dwOptions, REGSAM samDesired, LPSECURITY_ATTRIBUTES lpSecurityAttributes, PHKEY phkResult, LPDWORD lpdwDisposition);
+    LONG WINAPI_CALL THETAZ_RegCreateKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, LPWSTR lpClass, DWORD dwOptions, REGSAM samDesired, LPSECURITY_ATTRIBUTES lpSecurityAttributes, PHKEY phkResult, LPDWORD lpdwDisposition);
+    LONG WINAPI_CALL THETAZ_RegCreateKeyW(HKEY hKey, LPCWSTR lpSubKey, PHKEY phkResult);
+    LONG WINAPI_CALL THETAZ_RegDeleteValueA(HKEY hKey, LPCSTR lpValueName);
+    LONG WINAPI_CALL THETAZ_RegDeleteValueW(HKEY hKey, LPCWSTR lpValueName);
+    LONG WINAPI_CALL THETAZ_RegEnumKeyExA(HKEY hKey, DWORD dwIndex, LPSTR lpName, LPDWORD lpcbName, LPDWORD lpReserved, LPSTR lpClass, LPDWORD lpcbClass, LPFILETIME lpftLastWriteTime);
+    LONG WINAPI_CALL THETAZ_RegEnumKeyExW(HKEY hKey, DWORD dwIndex, LPWSTR lpName, LPDWORD lpcbName, LPDWORD lpReserved, LPWSTR lpClass, LPDWORD lpcbClass, LPFILETIME lpftLastWriteTime);
+    LONG WINAPI_CALL THETAZ_RegGetValueW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpValue, DWORD dwFlags, LPDWORD pdwType, void* pvData, LPDWORD pcbData);
+    HANDLE WINAPI_CALL THETAZ_RegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, DWORD samDesired, PHKEY phkResult);
+    HANDLE WINAPI_CALL THETAZ_RegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, DWORD samDesired, PHKEY phkResult);
+    LONG WINAPI_CALL THETAZ_RegQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
+    LONG WINAPI_CALL THETAZ_RegQueryValueExW(HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
+    LONG WINAPI_CALL THETAZ_RegSetValueExA(HKEY hKey, LPCSTR lpValueName, DWORD Reserved, DWORD dwType, const BYTE* lpData, DWORD cbData);
+    LONG WINAPI_CALL THETAZ_RegSetValueExW(HKEY hKey, LPCWSTR lpValueName, DWORD Reserved, DWORD dwType, const BYTE* lpData, DWORD cbData);
+    ATOM WINAPI_CALL THETAZ_RegisterClassExW(const void* lpwcx);
+    UINT WINAPI_CALL THETAZ_RegisterClipboardFormatA(LPCSTR lpszFormat);
+    UINT WINAPI_CALL THETAZ_RegisterClipboardFormatW(LPCWSTR lpszFormat);
+    UINT WINAPI_CALL THETAZ_RegisterWindowMessageA(LPCSTR lpString);
+    int WINAPI_CALL THETAZ_ReleaseDC(void* hwnd, void* hdc);
+    BOOL WINAPI_CALL THETAZ_ReleaseMutex(HANDLE hMutex);
+    void WINAPI_CALL THETAZ_ReleaseSRWLockExclusive(void* SRWLock);
+    void WINAPI_CALL THETAZ_ReleaseSRWLockShared(void* SRWLock);
+    BOOL WINAPI_CALL THETAZ_ReleaseSemaphore(HANDLE hSemaphore, LONG lReleaseCount, LONG* lpPreviousCount);
+    BOOL WINAPI_CALL THETAZ_RemoveDirectoryW(LPCWSTR lpPathName);
+    HANDLE WINAPI_CALL THETAZ_RemovePropA(HWND hWnd, LPCSTR lpString);
+    BOOL WINAPI_CALL THETAZ_RemoveVectoredContinueHandler(PVOID handle);
+    BOOL WINAPI_CALL THETAZ_RemoveVectoredExceptionHandler(PVOID handle);
+    BOOL WINAPI_CALL THETAZ_ResetEvent(HANDLE hEvent);
+    BOOL WINAPI_CALL THETAZ_ResumeThread(HANDLE hThread);
+    WORD WINAPI_CALL THETAZ_RtlCaptureStackBackTrace(DWORD FramesToSkip, DWORD FramesToCapture, void** BackTrace, DWORD* BackTraceHash);
+    uint64_t WINAPI_CALL THETAZ_RtlLookupFunctionEntry(uint64_t controlPc, uint64_t* imageBase, void* historyTable);
+    void WINAPI_CALL THETAZ_RtlUnwind(void* TargetFrame, void* TargetIp, void* ExceptionRecord, DWORD ReturnValue);
+    void WINAPI_CALL THETAZ_RtlUnwindEx(void* TargetFrame, void* TargetIp, void* ExceptionRecord, void* ReturnValue, void* ContextRecord, void* HistoryTable);
+    int WINAPI_CALL THETAZ_SHFileOperationW(void* lpFileOp);
+    HRESULT WINAPI_CALL THETAZ_SHGetFileInfoW(LPCWSTR pszPath, DWORD dwFileAttributes, void* psfi, UINT cbFileInfo, UINT uFlags);
+    HRESULT WINAPI_CALL THETAZ_SHGetSpecialFolderLocation(HWND hwnd, int csidl, void** ppidl);
+    HRESULT WINAPI_CALL THETAZ_SafeArrayCreate(DWORD vt, UINT cDims, void* rgsabound);
+    HRESULT WINAPI_CALL THETAZ_SafeArrayDestroy(void* psa);
+    UINT WINAPI_CALL THETAZ_SafeArrayGetDim(void* psa);
+    HRESULT WINAPI_CALL THETAZ_SafeArrayGetLBound(void* psa, UINT nDim, long* plLbound);
+    LRESULT WINAPI_CALL THETAZ_SendMessageTimeoutA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam, UINT fuFlags, UINT uTimeout, PDWORD_PTR lpdwResult);
+    LRESULT WINAPI_CALL THETAZ_SendMessageTimeoutW(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam, UINT fuFlags, UINT uTimeout, PDWORD_PTR lpdwResult);
+    DWORD WINAPI_CALL THETAZ_SetBkColor(void* hdc, DWORD color);
+    int WINAPI_CALL THETAZ_SetBkMode(void* hdc, int mode);
+    BOOL WINAPI_CALL THETAZ_SetConsoleMode(HANDLE hConsoleHandle, DWORD dwMode);
+    BOOL WINAPI_CALL THETAZ_SetCurrentDirectoryA(LPCSTR lpPathName);
+    BOOL WINAPI_CALL THETAZ_SetCurrentDirectoryW(LPCWSTR lpPathName);
+    void WINAPI_CALL THETAZ_SetDefaultDllDirectories(DWORD DirectoryFlags);
+    BOOL WINAPI_CALL THETAZ_SetDlgItemTextW(HWND hDlg, int nIDDlgItem, LPCWSTR lpString);
+    BOOL WINAPI_CALL THETAZ_SetEndOfFile(HANDLE hFile);
+    BOOL WINAPI_CALL THETAZ_SetEnvironmentVariableA(LPCSTR lpName, LPCSTR lpValue);
+    BOOL WINAPI_CALL THETAZ_SetEnvironmentVariableW(LPCWSTR lpName, LPCWSTR lpValue);
+    UINT WINAPI_CALL THETAZ_SetErrorMode(UINT uMode);
+    BOOL WINAPI_CALL THETAZ_SetEvent(HANDLE hEvent);
+    BOOL WINAPI_CALL THETAZ_SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes);
+    BOOL WINAPI_CALL THETAZ_SetFileInformationByHandle(HANDLE hFile, DWORD FileInformationClass, void* lpFileInformation, DWORD dwBufferSize);
+    DWORD WINAPI_CALL THETAZ_SetFilePointer(HANDLE hFile, LONG lDistanceToMove, LONG* lpDistanceToMoveHigh, DWORD dwMoveMethod);
+    BOOL WINAPI_CALL THETAZ_SetFilePointerEx(HANDLE hFile, LARGE_INTEGER liDistanceToMove, LARGE_INTEGER* lpNewFilePointer, DWORD dwMoveMethod);
+    BOOL WINAPI_CALL THETAZ_SetFileTime(HANDLE hFile, const FILETIME* lpCreationTime, const FILETIME* lpLastAccessTime, const FILETIME* lpLastWriteTime);
+    BOOL WINAPI_CALL THETAZ_SetHandleInformation(HANDLE hObject, DWORD dwMask, DWORD dwFlags);
+    void WINAPI_CALL THETAZ_SetLastError(DWORD dwErrCode);
+    BOOL WINAPI_CALL THETAZ_SetNamedPipeHandleState(HANDLE hNamedPipe, LPDWORD lpMode, LPDWORD lpMaxCollectionCount, LPDWORD lpCollectionDataSize);
+    void WINAPI_CALL THETAZ_SetProcessDPIAware();
+    BOOL WINAPI_CALL THETAZ_SetProcessMitigationPolicy(DWORD Policy, void* lpBuffer, SIZE_T dwLength);
+    BOOL WINAPI_CALL THETAZ_SetStdHandle(DWORD nStdHandle, HANDLE hHandle);
+    DWORD WINAPI_CALL THETAZ_SetTextColor(void* hdc, DWORD color);
+    BOOL WINAPI_CALL THETAZ_SetThreadContext(HANDLE hThread, WOW64CONTEXT* ctx);
+    HRESULT WINAPI_CALL THETAZ_SetThreadDescription(HANDLE hThread, PCWSTR lpThreadDescription);
+    BOOL WINAPI_CALL THETAZ_SetThreadPriority(HANDLE hThread, int nPriority);
+    
+    BOOL WINAPI_CALL THETAZ_SetWaitableTimerEx(HANDLE hTimer, const LARGE_INTEGER* lpDueTime, LONG lPeriod, void* pfnCompletionRoutine, void* lpArgToCompletionRoutine, void* WakeContext, LONG Reserved);
+    DWORD WINAPI_CALL THETAZ_SizeofResource(HMODULE hModule, void* hResInfo);
+    DWORD WINAPI_CALL THETAZ_Sleep(DWORD dwMilliseconds);
+    BOOL WINAPI_CALL THETAZ_SleepConditionVariableCS(PCONDITION_VARIABLE ConditionVariable, PCRITICAL_SECTION CriticalSection, DWORD dwMilliseconds);
+    BOOL WINAPI_CALL THETAZ_SleepConditionVariableSRW(PCONDITION_VARIABLE ConditionVariable, PSRWLOCK SRWLock, DWORD dwMilliseconds, ULONG Flags);
+    HRESULT WINAPI_CALL THETAZ_StringFromCLSID(REFCLSID rclsid, LPOLESTR* lplpsz);
+    BOOL WINAPI_CALL THETAZ_SuspendThread(HANDLE hThread);
+    BOOL WINAPI_CALL THETAZ_SwitchToThread();
+    BOOL WINAPI_CALL THETAZ_SystemParametersInfoW(UINT uiAction, UINT uiParam, void* pvParam, UINT fWinIni);
+    BOOL WINAPI_CALL THETAZ_SystemTimeToFileTime(const SYSTEMTIME* lpSystemTime, FILETIME* lpFileTime);
+    BOOL WINAPI_CALL THETAZ_TerminateProcess(HANDLE hProcess, UINT uExitCode);
+    BOOL WINAPI_CALL THETAZ_TextOutA(void* hdc, int x, int y, const char* lpString, int c);
+    BOOL WINAPI_CALL THETAZ_TextOutW(void* hdc, int x, int y, const uint16_t* lpString, int c);
+    DWORD WINAPI_CALL THETAZ_TlsAlloc();
+    BOOL WINAPI_CALL THETAZ_TlsFree(DWORD dwTlsIndex);
+    LPVOID WINAPI_CALL THETAZ_TlsGetValue(DWORD dwTlsIndex);
+    BOOL WINAPI_CALL THETAZ_TlsSetValue(DWORD dwTlsIndex, LPVOID lpTlsValue);
+    BOOL WINAPI_CALL THETAZ_TryAcquireSRWLockExclusive(void* SRWLock);
+    BOOL WINAPI_CALL THETAZ_TryEnterCriticalSection(PCRITICAL_SECTION lpCriticalSection);
+    BOOL WINAPI_CALL THETAZ_TzSpecificLocalTimeToSystemTime(const TIME_ZONE_INFORMATION* lpTimeZoneInformation, const SYSTEMTIME* lpLocalTime, SYSTEMTIME* lpUniversalTime);
+    LONG WINAPI_CALL THETAZ_UnhandledExceptionFilter(void* ExceptionInfo);
+    BOOL WINAPI_CALL THETAZ_UnlockFile(HANDLE hFile, DWORD dwFileOffsetLow, DWORD dwFileOffsetHigh, DWORD nNumberOfBytesToUnlockLow, DWORD nNumberOfBytesToUnlockHigh);
+    BOOL WINAPI_CALL THETAZ_UnlockFileEx(HANDLE hFile, DWORD dwReserved, DWORD nNumberOfBytesToUnlockLow, DWORD nNumberOfBytesToUnlockHigh, void* lpOverlapped);
+    BOOL WINAPI_CALL THETAZ_UnmapViewOfFile(LPCVOID lpBaseAddress);
+    uint64_t WINAPI_CALL THETAZ_VerSetConditionMask(uint64_t ConditionMask, DWORD TypeMask, BYTE Condition);
+    BOOL WINAPI_CALL THETAZ_VerifyVersionInfoW(void* lpVersionInformation, DWORD dwTypeMask, uint64_t dwlConditionMask);
+    LPVOID WINAPI_CALL THETAZ_VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize, DWORD flAllocationType, DWORD flProtect);
+    BOOL WINAPI_CALL THETAZ_VirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType);
+    BOOL WINAPI_CALL THETAZ_VirtualProtect(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect);
+    BOOL WINAPI_CALL THETAZ_VirtualProtectEx(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, PDWORD lpflOldProtect);
+    SIZE_T WINAPI_CALL THETAZ_VirtualQuery(LPCVOID lpAddress, PMEMORY_BASIC_INFORMATION lpBuffer, SIZE_T dwLength);
+    SIZE_T WINAPI_CALL THETAZ_VirtualQueryEx(HANDLE hProcess, LPCVOID lpAddress, PMEMORY_BASIC_INFORMATION lpBuffer, SIZE_T dwLength);
+    DWORD WINAPI_CALL THETAZ_WaitForMultipleObjects(DWORD nCount, const HANDLE* lpHandles,
+                                                BOOL bWaitAll, DWORD dwMilliseconds);
+    DWORD WINAPI_CALL THETAZ_WaitForMultipleObjectsEx(DWORD nCount, const HANDLE* lpHandles, BOOL bWaitAll, DWORD dwMilliseconds, BOOL bAlertable);
+    DWORD WINAPI_CALL THETAZ_WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
+    DWORD WINAPI_CALL THETAZ_WaitForSingleObjectEx(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertable);
+    BOOL WINAPI_CALL THETAZ_WaitNamedPipeA(LPCSTR lpNamedPipeName, DWORD nTimeout);
+    BOOL WINAPI_CALL THETAZ_WaitNamedPipeW(LPCWSTR lpNamedPipeName, DWORD nTimeout);
+    void WINAPI_CALL THETAZ_WakeAllConditionVariable(PCONDITION_VARIABLE ConditionVariable);
+    void WINAPI_CALL THETAZ_WakeConditionVariable(PCONDITION_VARIABLE ConditionVariable);
+    LONG WINAPI_CALL THETAZ_WerRegisterMemoryBlock(void* pvAddress, DWORD dwSize);
+    LONG WINAPI_CALL THETAZ_WerUnregisterMemoryBlock(void* pvAddress);
+    BOOL WINAPI_CALL THETAZ_WideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWSTR lpWideCharStr, int cchWideChar,
+                                             LPSTR lpMultiByteStr, int cbMultiByte, LPCSTR lpDefaultChar, LPBOOL lpUsedDefaultChar);
+    HRESULT WINAPI_CALL THETAZ_WriteClassStg(void* pstg, REFCLSID rclsid);
+    HRESULT WINAPI_CALL THETAZ_WriteClassStm(void* pstg, REFCLSID rclsid);
+    BOOL WINAPI_CALL THETAZ_WriteConsoleW(HANDLE hConsoleOutput, const void* lpBuffer, DWORD nNumberOfCharsToWrite,
+                                       LPDWORD lpNumberOfCharsWritten, PCONSOLE_READCONSOLE_CONTROL lpConsoleReadControl);
+    BOOL WINAPI_CALL THETAZ_WriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite,
+                                   LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped);
+    HRESULT WINAPI_CALL THETAZ_WriteFmtUserTypeStg(void* pstg, void* pfmtetc, DWORD dwUserType, LPWSTR lpszUserType);
+    BOOL WINAPI_CALL THETAZ_WriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesWritten);
+    BOOL WINAPI_CALL THETAZ___WSAFDIsSet(SOCKET fd, void* pfdset);
+    int WINAPI_CALL THETAZ__dclass(int c);
+    int WINAPI_CALL THETAZ__wcslwr(wchar_t* str);
+    int WINAPI_CALL THETAZ__wrmdir(const wchar_t* dirname);
+    int WINAPI_CALL THETAZ__wsopen_s(int* pfh, const wchar_t* filename, int oflag, int shflag, int pmode);
+    INT WINAPI_CALL THETAZ_lstrcmpW(LPCWSTR lpString1, LPCWSTR lpString2);
+    INT WINAPI_CALL THETAZ_lstrcmpiW(LPCWSTR lpString1, LPCWSTR lpString2);
+    LPWSTR WINAPI_CALL THETAZ_lstrcpyW(LPWSTR lpString1, LPCWSTR lpString2);
+    INT WINAPI_CALL THETAZ_lstrlenW(LPCWSTR lpString);
+
+
+// Function implementations
+
+BOOL WINAPI_CALL THETAZ_CheckDlgButton(WinHandle hdlg, int id, uint32_t check) {
+    uint64_t ctrl = THETAZ_GetDlgItem((uint64_t)(uintptr_t)hdlg, id);
+    if (!ctrl) return FALSE_VALUE;
+    return THETAZ_SendMessageA(ctrl, BM_SETCHECK, check ? 1 : 0, 0) ? TRUE_VALUE : FALSE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_CheckDlgButton_Wrapper(WinHandle hdlg, int id, uint32_t check) {
+    if (x86_dispatch_active()) return THETAZ_CheckDlgButton(hdlg, id, check);
+    return WINAPI64_CheckDlgButton(reinterpret_cast<uint64_t>(hdlg), id, check);
+}
+
+BOOL WINAPI_CALL THETAZ_CryptVerifySignatureW(uint64_t hHash, const uint8_t* pbSignature, DWORD dwSigLen,
+    uint64_t hPubKey, const wchar_t* szDescription, DWORD dwFlags) {
+    (void)hHash; (void)pbSignature; (void)dwSigLen;
+    (void)hPubKey; (void)szDescription; (void)dwFlags;
+    return 0;
+}
+
+BOOL WINAPI_CALL THETAZ_DestroyWindow(WinHandle hwnd) {
+    uint64_t h = reinterpret_cast<uint64_t>(hwnd);
+    uint64_t wnd_proc = 0;
+    Window* win = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_window_mutex);
+        win = find_window(h);
+        if (!win) return FALSE_VALUE;
+    }
+    call_wnd_proc(win, WM_DESTROY, 0, 0);
+    {
+        std::lock_guard<std::mutex> lock(g_window_mutex);
+        // Destroy children (X11 subwindows die with the parent, but our
+        // registry needs cleaning).
+        for (auto it = g_windows.begin(); it != g_windows.end();) {
+            if (it->second.parent == h) {
+                auto xit = g_x11_windows.find(it->first);
+                if (xit != g_x11_windows.end()) {
+                    g_x11_hwnds.erase(xit->second);
+                    g_x11_windows.erase(xit);
+                }
+                it = g_windows.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        g_windows.erase(h);
+        auto xit = g_x11_windows.find(h);
+        if (xit != g_x11_windows.end()) {
+            g_x11_hwnds.erase(xit->second);
+            g_x11_windows.erase(xit);
+        }
+    }
+    return TRUE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_DestroyWindow_Wrapper(WinHandle hwnd) {
+    if (x86_dispatch_active()) {
+        return THETAZ_DestroyWindow(hwnd);
+    } else {
+        return WINAPI64_DestroyWindow(reinterpret_cast<uint64_t>(hwnd));
+    }
+}
+
+int WINAPI_CALL THETAZ_DialogBoxParamA_Wrapper(WinHandle hInstance, const char* name,
+                                                      WinHandle hWndParent, void* lpDialogFunc,
+                                                      uint64_t dwInitParam) {
+    if (x86_dispatch_active()) return THETAZ_DialogBoxParamA(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hInstance)), name, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hWndParent)), lpDialogFunc, dwInitParam);
+    return WINAPI64_DialogBoxParamA(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hInstance)), name, reinterpret_cast<uint64_t>(hWndParent), lpDialogFunc, dwInitParam);
+}
+
+BOOL WINAPI_CALL THETAZ_EnableWindow(WinHandle hwnd, BOOL enable) {
+    uint64_t h = reinterpret_cast<uint64_t>(hwnd);
+    std::lock_guard<std::mutex> lock(g_window_mutex);
+    Window* win = find_window(h);
+    if (!win) return FALSE_VALUE;
+    BOOL was = win->enabled ? TRUE_VALUE : FALSE_VALUE;
+    win->enabled = (enable != 0);
+    return was;
+}
+
+BOOL WINAPI_CALL THETAZ_EnableWindow_Wrapper(WinHandle hwnd, BOOL enable) {
+    if (x86_dispatch_active()) return THETAZ_EnableWindow(hwnd, enable);
+    return WINAPI64_EnableWindow(reinterpret_cast<uint64_t>(hwnd), enable);
+}
+
+BOOL WINAPI_CALL THETAZ_EndDialog(WinHandle hdlg, int result) {
+    uint64_t h = reinterpret_cast<uint64_t>(hdlg);
+    {
+        std::lock_guard<std::mutex> lock(g_window_mutex);
+        g_dialog_result_active = true;
+        g_dialog_result = result;
+        auto xit = g_x11_windows.find(h);
+        if (xit != g_x11_windows.end()) {
+            g_x11_hwnds.erase(xit->second);
+            g_x11_windows.erase(xit);
+        }
+        g_windows.erase(h);
+    }
+    return TRUE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_EndDialog_Wrapper(WinHandle hdlg, int result) {
+    if (x86_dispatch_active()) return THETAZ_EndDialog(hdlg, result);
+    return WINAPI64_EndDialog(reinterpret_cast<uint64_t>(hdlg), result);
+}
+
+BOOL WINAPI_CALL THETAZ_EndPaint(WinHandle hwnd, const void* ps) {
+    (void)hwnd;
+    (void)ps;
+    return TRUE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_EndPaint_Wrapper(WinHandle hwnd, const void* ps) {
+    if (x86_dispatch_active()) {
+        return THETAZ_EndPaint(hwnd, ps);
+    } else {
+        return WINAPI64_EndPaint(reinterpret_cast<uint64_t>(hwnd), ps);
+    }
+}
+
+int WINAPI_CALL THETAZ_GetDlgCtrlID(WinHandle hwnd) {
+    std::lock_guard<std::mutex> lock(g_window_mutex);
+    Window* win = find_window(reinterpret_cast<uint64_t>(hwnd));
+    return win ? static_cast<int>(win->id) : 0;
+}
+
+int WINAPI_CALL THETAZ_GetDlgCtrlID_Wrapper(WinHandle hwnd) {
+    if (x86_dispatch_active()) return THETAZ_GetDlgCtrlID(hwnd);
+    return WINAPI64_GetDlgCtrlID(reinterpret_cast<uint64_t>(hwnd));
+}
+
+int WINAPI_CALL THETAZ_GetDlgItemTextA(WinHandle hdlg, int id, char* buf, int max) {
+    uint64_t ctrl = THETAZ_GetDlgItem(reinterpret_cast<uint64_t>(hdlg), id);
+    if (!ctrl || !buf || max <= 0) return 0;
+    uint64_t r = THETAZ_SendMessageA(ctrl, WM_GETTEXT, static_cast<uint64_t>(max),
+                                     reinterpret_cast<uint64_t>(buf));
+    return static_cast<int>(r);
+}
+
+int WINAPI_CALL THETAZ_GetDlgItemTextA_Wrapper(WinHandle hdlg, int id, char* buf, int max) {
+    if (x86_dispatch_active()) return THETAZ_GetDlgItemTextA(hdlg, id, buf, max);
+    return WINAPI64_GetDlgItemTextA(reinterpret_cast<uint64_t>(hdlg), id, buf, max);
+}
+
+LONG WINAPI_CALL THETAZ_GetMessageA(void* msg, WinHandle hwnd, DWORD filter_min, DWORD filter_max) {
+    (void)hwnd;
+    if (!msg) return -1;
+
+    std::unique_lock<std::mutex> lock(g_window_mutex);
+    while (true) {
+        if (!g_queue.empty()) {
+            GuestMsg m = g_queue.front();
+            bool matches_filter = (filter_min == 0 && filter_max == 0) ||
+                                  (m.message >= filter_min && m.message <= filter_max);
+            if (m.message == WM_QUIT) {
+                // WM_QUIT is never filtered and ends the loop.
+                g_queue.pop_front();
+                g_quit_pending = false;
+                write_guest_msg(static_cast<uint8_t*>(msg), m);
+                printf("[user32] GetMessageA -> WM_QUIT (%lu)\n", (unsigned long)m.wparam);
+                return 0;
+            }
+            if (matches_filter) {
+                g_queue.pop_front();
+                write_guest_msg(static_cast<uint8_t*>(msg), m);
+                return 1;
+            }
+            // Doesn't match: leave it queued and wait for a matching message.
+        }
+        g_queue_cond.wait(lock);
+    }
+}
+
+LONG WINAPI_CALL THETAZ_GetMessageA_Wrapper(void* msg, WinHandle hwnd, DWORD filter_min, DWORD filter_max) {
+    if (x86_dispatch_active()) {
+        return THETAZ_GetMessageA(msg, hwnd, filter_min, filter_max);
+    } else {
+        return WINAPI64_GetMessageA(msg, reinterpret_cast<uint64_t>(hwnd), filter_min, filter_max);
+    }
+}
+
+int WINAPI_CALL THETAZ_GetWindowTextA(WinHandle hwnd, char* buf, int max) {
+    if (!buf || max <= 0) return 0;
+    uint64_t r = THETAZ_SendMessageA(reinterpret_cast<uint64_t>(hwnd), WM_GETTEXT, static_cast<uint64_t>(max),
+                                     reinterpret_cast<uint64_t>(buf));
+    return static_cast<int>(r);
+}
+
+int WINAPI_CALL THETAZ_GetWindowTextA_Wrapper(WinHandle hwnd, char* buf, int max) {
+    if (x86_dispatch_active()) return THETAZ_GetWindowTextA(hwnd, buf, max);
+    return WINAPI64_GetWindowTextA(reinterpret_cast<uint64_t>(hwnd), buf, max);
+}
+
+int WINAPI_CALL THETAZ_GetWindowTextLengthA(WinHandle hwnd) {
+    return static_cast<int>(THETAZ_SendMessageA(reinterpret_cast<uint64_t>(hwnd), WM_GETTEXTLENGTH, 0, 0));
+}
+
+int WINAPI_CALL THETAZ_GetWindowTextLengthA_Wrapper(WinHandle hwnd) {
+    if (x86_dispatch_active()) return THETAZ_GetWindowTextLengthA(hwnd);
+    return WINAPI64_GetWindowTextLengthA(reinterpret_cast<uint64_t>(hwnd));
+}
+
+BOOL WINAPI_CALL THETAZ_InvalidateRect(WinHandle hwnd, const void* rect, BOOL erase) {
+    (void)erase;
+    std::lock_guard<std::mutex> lock(g_window_mutex);
+    Window* win = find_window(reinterpret_cast<uint64_t>(hwnd));
+    if (!win) return FALSE_VALUE;
+    win->dirty = true;
+    if (rect) {
+        const int* r = static_cast<const int*>(rect);
+        win->inv_left = r[0];
+        win->inv_top = r[1];
+        win->inv_right = r[2];
+        win->inv_bottom = r[3];
+    } else {
+        win->inv_left = 0;
+        win->inv_top = 0;
+        win->inv_right = win->w;
+        win->inv_bottom = win->h;
+    }
+    return TRUE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_InvalidateRect_Wrapper(WinHandle hwnd, const void* rect, BOOL erase) {
+    if (x86_dispatch_active()) {
+        return THETAZ_InvalidateRect(hwnd, rect, erase);
+    } else {
+        return WINAPI64_InvalidateRect(reinterpret_cast<uint64_t>(hwnd), rect, erase);
+    }
+}
+
+BOOL WINAPI_CALL THETAZ_IsWindow(WinHandle hwnd) {
+    std::lock_guard<std::mutex> lock(g_window_mutex);
+    return find_window(reinterpret_cast<uint64_t>(hwnd)) ? TRUE_VALUE : FALSE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_IsWindowEnabled(WinHandle hwnd) {
+    std::lock_guard<std::mutex> lock(g_window_mutex);
+    Window* win = find_window(reinterpret_cast<uint64_t>(hwnd));
+    return (win && win->enabled) ? TRUE_VALUE : FALSE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_IsWindowEnabled_Wrapper(WinHandle hwnd) {
+    if (x86_dispatch_active()) return THETAZ_IsWindowEnabled(hwnd);
+    return WINAPI64_IsWindowEnabled(reinterpret_cast<uint64_t>(hwnd));
+}
+
+BOOL WINAPI_CALL THETAZ_IsWindowVisible(WinHandle hwnd) {
+    std::lock_guard<std::mutex> lock(g_window_mutex);
+    Window* win = find_window(reinterpret_cast<uint64_t>(hwnd));
+    return (win && win->visible) ? TRUE_VALUE : FALSE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_IsWindowVisible_Wrapper(WinHandle hwnd) {
+    if (x86_dispatch_active()) return THETAZ_IsWindowVisible(hwnd);
+    return WINAPI64_IsWindowVisible(reinterpret_cast<uint64_t>(hwnd));
+}
+
+BOOL WINAPI_CALL THETAZ_IsWindow_Wrapper(WinHandle hwnd) {
+    if (x86_dispatch_active()) return THETAZ_IsWindow(hwnd);
+    return WINAPI64_IsWindow(reinterpret_cast<uint64_t>(hwnd));
+}
+
+BOOL WINAPI_CALL THETAZ_KillTimer(WinHandle hwnd, uintptr_t nIDEvent) {
+    uint64_t h = hwnd ? reinterpret_cast<uint64_t>(hwnd) : kDesktopHwnd;
+    std::lock_guard<std::mutex> lock(g_window_mutex);
+    size_t erased = g_timers.erase((h << 32) | static_cast<uint32_t>(nIDEvent));
+    g_timer_cv.notify_all();
+    return erased ? TRUE_VALUE : FALSE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_KillTimer_Wrapper(WinHandle hwnd, uintptr_t nIDEvent) {
+    if (x86_dispatch_active()) {
+        return THETAZ_KillTimer(hwnd, nIDEvent);
+    } else {
+        return WINAPI64_KillTimer(reinterpret_cast<uint64_t>(hwnd), nIDEvent);
+    }
+}
+
+int WINAPI_CALL THETAZ_MessageBoxA(WinHandle hwnd, const char* text,
+                                          const char* caption, uint32_t type) {
+    (void)hwnd;
+    (void)type;
+    fprintf(stderr, "[user32] MessageBoxA: \"%s\" title=\"%s\"\n",
+            text ? text : "", caption ? caption : "");
+    return 1; // IDOK
+}
+
+int WINAPI_CALL THETAZ_MessageBoxA_Wrapper(WinHandle hwnd, const char* text,
+                                                  const char* caption, uint32_t type) {
+    if (x86_dispatch_active()) return THETAZ_MessageBoxA(hwnd, text, caption, type);
+    return WINAPI64_MessageBoxA(reinterpret_cast<uint64_t>(hwnd), text, caption, type);
+}
+
+BOOL WINAPI_CALL THETAZ_PathMatchSpecW(const uint16_t* p, const uint16_t* sp){
+    if(!p||!sp)return FALSE;size_t pl=wcslen(reinterpret_cast<const wchar_t*>(p)),sl=wcslen(reinterpret_cast<const wchar_t*>(sp));
+    if(wcscmp(reinterpret_cast<const wchar_t*>(sp),reinterpret_cast<const wchar_t*>(u"*.*"))==0)return TRUE;
+    if(reinterpret_cast<const uint16_t*>(sp)[0]==0x2a&&reinterpret_cast<const uint16_t*>(sp)[sl-1]==0x2a){return wcsncasecmp(reinterpret_cast<const wchar_t*>(p),reinterpret_cast<const wchar_t*>(sp)+1,sl-2)==0;}
+    if(reinterpret_cast<const uint16_t*>(sp)[0]==0x2a){return wcscasecmp(reinterpret_cast<const wchar_t*>(p)+pl-(sl-1),reinterpret_cast<const wchar_t*>(sp)+1)==0||wcscasecmp(reinterpret_cast<const wchar_t*>(p),reinterpret_cast<const wchar_t*>(sp)+1)==0;}
+    return wcscasecmp(reinterpret_cast<const wchar_t*>(p),reinterpret_cast<const wchar_t*>(sp))==0;
+}
+
+BOOL WINAPI_CALL THETAZ_PeekMessageA(void* msg, WinHandle hwnd, DWORD filter_min, DWORD filter_max, DWORD remove) {
+    (void)hwnd;
+    if (!msg) return FALSE_VALUE;
+    std::lock_guard<std::mutex> lock(g_window_mutex);
+    for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
+        bool matches_filter = (filter_min == 0 && filter_max == 0) ||
+                              (it->message >= filter_min && it->message <= filter_max);
+        if (it->message == WM_QUIT || matches_filter) {
+            GuestMsg m = *it;
+            if (remove) {
+                g_queue.erase(it);
+                if (m.message == WM_QUIT) g_quit_pending = false;
+            }
+            write_guest_msg(static_cast<uint8_t*>(msg), m);
+            return TRUE_VALUE;
+        }
+    }
+    return FALSE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_PeekMessageA_Wrapper(void* msg, WinHandle hwnd, DWORD filter_min, DWORD filter_max, DWORD remove) {
+    if (x86_dispatch_active()) {
+        return THETAZ_PeekMessageA(msg, hwnd, filter_min, filter_max, remove);
+    } else {
+        return WINAPI64_PeekMessageA(msg, reinterpret_cast<uint64_t>(hwnd), filter_min, filter_max, remove);
+    }
+}
+
+BOOL WINAPI_CALL THETAZ_PostMessageA(WinHandle hwnd, DWORD message, uint64_t wparam, uint64_t lparam) {
+    GuestMsg m;
+    m.hwnd = hwnd ? reinterpret_cast<uint64_t>(hwnd) : kDesktopHwnd;
+    m.message = message;
+    m.wparam = wparam;
+    m.lparam = lparam;
+    {
+        std::lock_guard<std::mutex> lock(g_window_mutex);
+        g_queue.push_back(m);
+    }
+    g_queue_cond.notify_all();
+    return TRUE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_PostMessageA_Wrapper(WinHandle hwnd, DWORD message, uint64_t wparam, uint64_t lparam) {
+    if (x86_dispatch_active()) {
+        return THETAZ_PostMessageA(hwnd, message, wparam, lparam);
+    } else {
+        return WINAPI64_PostMessageA(reinterpret_cast<uint64_t>(hwnd), message, wparam, lparam);
+    }
+}
+
+void WINAPI_CALL THETAZ_PostQuitMessage(int exit_code) {
+    printf("[user32] PostQuitMessage(%d)\n", exit_code);
+    std::lock_guard<std::mutex> lock(g_window_mutex);
+    g_quit_pending = true;
+    g_quit_exit_code = static_cast<DWORD>(exit_code);
+    GuestMsg m;
+    m.hwnd = 0;
+    m.message = WM_QUIT;
+    m.wparam = static_cast<uint64_t>(static_cast<uint32_t>(exit_code));
+    g_queue.push_back(m);
+    g_queue_cond.notify_all();
+}
+
+void WINAPI_CALL THETAZ_PostQuitMessage_Wrapper(int exit_code) {
+    if (x86_dispatch_active()) {
+        THETAZ_PostQuitMessage(exit_code);
+    } else {
+        WINAPI64_PostQuitMessage(exit_code);
+    }
+}
+
+}
+
+// CRT local-unwind helpers used by longjmp through SEH frames.
+static void WINAPI_CALL ucrt__local_unwind2(void* frame_, int trylevel) {
+    uint32_t frame = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(frame_));
+    uint32_t scopetable = *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(frame + 8));
+    uint32_t saved_ebp = *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(frame + 16));
+    uint32_t lvl = *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(frame + 12));
+    if (!scopetable || scopetable >= 0x80000000u) return;
+    while (lvl != 0xFFFFFFFFu && lvl != static_cast<uint32_t>(trylevel)) {
+        const uint32_t* e =
+            reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(scopetable + lvl * 12));
+        uint32_t filter = e[1], handler = e[2];
+        lvl = e[0];
+        if (!filter && handler)
+            x86_call_guest_args_ebp(handler, static_cast<uint32_t*>(nullptr), 0, saved_ebp);
+    }
+}
+
+BOOL WINAPI_CALL THETAZ_SetDlgItemTextA(WinHandle hdlg, int id, const char* text) {
+    uint64_t ctrl = THETAZ_GetDlgItem((uint64_t)(uintptr_t)hdlg, id);
+    if (!ctrl) return FALSE_VALUE;
+    THETAZ_SendMessageA(ctrl, WM_SETTEXT, 0, (uint64_t)(uintptr_t)text);
+    return TRUE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_SetDlgItemTextA_Wrapper(WinHandle hdlg, int id, const char* text) {
+    if (x86_dispatch_active()) return THETAZ_SetDlgItemTextA(hdlg, id, text);
+    return WINAPI64_SetDlgItemTextA(reinterpret_cast<uint64_t>(hdlg), id, text);
+}
+
+LONG WINAPI_CALL THETAZ_SetErrorInfo(DWORD dwReserved, void* perrinfo) {
+    (void)dwReserved;
+    (void)perrinfo;
+    return 0; // S_OK
+}
+
+BOOL WINAPI_CALL THETAZ_SetWindowTextA(WinHandle hwnd, const char* text) {
+    if (!hwnd) return FALSE_VALUE;
+    return THETAZ_SendMessageA(reinterpret_cast<uint64_t>(hwnd), WM_SETTEXT, 0, reinterpret_cast<uint64_t>(text))
+        ? TRUE_VALUE : FALSE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_SetWindowTextA_Wrapper(WinHandle hwnd, const char* text) {
+    if (x86_dispatch_active()) return THETAZ_SetWindowTextA(hwnd, text);
+    return WINAPI64_SetWindowTextA(reinterpret_cast<uint64_t>(hwnd), text);
+}
+
+BOOL WINAPI_CALL THETAZ_ShowWindow(WinHandle hwnd, int cmd_show) {
+    uint64_t h = reinterpret_cast<uint64_t>(hwnd);
+    ::Window xw = 0;
+    bool was_visible;
+    {
+        std::lock_guard<std::mutex> lock(g_window_mutex);
+        ThetaZ::Window* win = find_window(h);
+        if (!win) return FALSE_VALUE;
+        was_visible = win->visible;
+        win->visible = (cmd_show != 0);
+        auto it = g_x11_windows.find(h);
+        if (it != g_x11_windows.end()) xw = it->second;
+    }
+    if (g_x11_display && xw) {
+        std::lock_guard<std::mutex> lock(g_x11_mutex);
+        if (cmd_show == 0) {
+            XUnmapWindow(g_x11_display, xw);
+        } else {
+            XMapRaised(g_x11_display, xw);
+        }
+        XFlush(g_x11_display);
+    }
+    return was_visible ? TRUE_VALUE : FALSE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_ShowWindow_Wrapper(WinHandle hwnd, int cmd_show) {
+    if (x86_dispatch_active()) {
+        return THETAZ_ShowWindow(hwnd, cmd_show);
+    } else {
+        return WINAPI64_ShowWindow(reinterpret_cast<uint64_t>(hwnd), cmd_show);
+    }
+}
+
+void WINAPI_CALL THETAZ_SysFreeString(BSTR bstr) {
+    free_bstr(bstr);
+}
+
+int WINAPI_CALL THETAZ_SysReAllocString(BSTR* pbstr, const OLECHAR* psz) {
+    if (!pbstr) return 0;
+    free_bstr(*pbstr);
+    *pbstr = THETAZ_SysAllocString(psz);
+    return *pbstr != nullptr ? 1 : 0;
+}
+
+int WINAPI_CALL THETAZ_SysReAllocStringLen(BSTR* pbstr, const OLECHAR* psz, UINT len) {
+    if (!pbstr) return 0;
+    free_bstr(*pbstr);
+    *pbstr = THETAZ_SysAllocStringLen(psz, len);
+    return *pbstr != nullptr ? 1 : 0;
+}
+
+UINT WINAPI_CALL THETAZ_SysStringLen(BSTR bstr) {
+    return static_cast<UINT>(bstr_byte_len(bstr) / sizeof(OLECHAR));
+}
+
+BOOL WINAPI_CALL THETAZ_TranslateMessage(const void* msg) {
+    if (!msg) return FALSE_VALUE;
+    const uint8_t* m = static_cast<const uint8_t*>(msg);
+    uint32_t message = *reinterpret_cast<const uint32_t*>(m + MSG_MESSAGE);
+    if (message == WM_KEYDOWN) {
+        uint64_t wparam = *reinterpret_cast<const uint32_t*>(m + MSG_WPARAM);
+        // Synthesize WM_CHAR for printable-ish keys (no keyboard state model).
+        THETAZ_PostMessageA(reinterpret_cast<WinHandle>(*reinterpret_cast<const uint32_t*>(m + MSG_HWND)),
+                            WM_CHAR, wparam, 1);
+        return TRUE_VALUE;
+    }
+    return FALSE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_TranslateMessage_Wrapper(const void* msg) {
+    if (x86_dispatch_active()) {
+        return THETAZ_TranslateMessage(msg);
+    } else {
+        return WINAPI64_TranslateMessage(msg);
+    }
+}
+
+BOOL WINAPI_CALL THETAZ_UpdateWindow(WinHandle hwnd) {
+    (void)hwnd;
+    return TRUE_VALUE;
+}
+
+BOOL WINAPI_CALL THETAZ_UpdateWindow_Wrapper(WinHandle hwnd) {
+    if (x86_dispatch_active()) {
+        return THETAZ_UpdateWindow(hwnd);
+    } else {
+        return WINAPI64_UpdateWindow(reinterpret_cast<uint64_t>(hwnd));
+    }
+}
+
+LONG WINAPI_CALL THETAZ_VariantChangeType(void* pvargDest, const void* pvargSrc, WORD wFlags, DWORD vt) {
+    (void)wFlags;
+    (void)vt;
+    return THETAZ_VariantCopy(pvargDest, pvargSrc);
+}
+
+LONG WINAPI_CALL THETAZ_VariantClear(void* pvarg) {
+    if (!pvarg) return 0x80000005; // E_FAIL
+    uint8_t* b = static_cast<uint8_t*>(pvarg);
+    DWORD vt = 0;
+    memcpy(&vt, b, 4);
+    if (vt == VT_BSTR) {
+        BSTR s = nullptr;
+        memcpy(&s, b + 8, sizeof(BSTR));
+        free_bstr(s);
+    }
+    memset(b, 0, 16);
+    return 0; // S_OK
+}
+
+LONG WINAPI_CALL THETAZ_VariantCopyInd(void* pvargDest, const void* pvargSrc) {
+    return THETAZ_VariantCopy(pvargDest, pvargSrc);
+}
+
+void WINAPI_CALL THETAZ_VariantInit(void* pvarg) {
+    if (pvarg) memset(pvarg, 0, 16);
+}
+
+BOOL WINAPI_CALL THETAZ_VirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType) {
+    WindowsAddressSpace& space = WindowsAddressSpace::instance();
+    if (!lpAddress) return 0;
+
+    if (dwFreeType & MEM_RELEASE) {
+        return space.release(lpAddress) ? 1 : 0;
+    }
+    if (dwFreeType & MEM_DECOMMIT) {
+        return space.decommit(lpAddress, dwSize) ? 1 : 0;
+    }
+    return 0;
+}
+
+BOOL WINAPI_CALL THETAZ_VirtualProtect(LPVOID lpAddress, SIZE_T dwSize, DWORD flNewProtect, DWORD* lpflOldProtect) {
+    if (!lpAddress) return 0;
+    if (WindowsAddressSpace::instance().protect(lpAddress, dwSize, flNewProtect, lpflOldProtect)) return 1;
+
+    // Not tracked by WindowsAddressSpace: guest images mmap'd by the PELoader,
+    // Wine DLL blobs and the shim pool are all deliberately kept RW(X) (guest
+    // code patches its IAT/data at runtime), and the identity-mapped 32-bit
+    // world is always writable through the interpreter. Restricting protection
+    // on natively-executed guest memory would SIGSEGV the host process, so just
+    // report success against the real backing mapping.
+    MemoryBasicInformation info;
+    if (query_from_proc_maps(lpAddress, &info)) {
+        if (lpflOldProtect) *lpflOldProtect = info.protect;
+        return 1;
+    }
+    return 0;
+}
+
+BOOL WINAPI_CALL THETAZ_WinHttpCloseHandle(void* hInternet) {
+    (void)hInternet;
+    return 1;
+}
+
+BOOL WINAPI_CALL THETAZ_WinHttpGetIEProxyConfigForCurrentUser(void* pProxyConfig) {
+    (void)pProxyConfig;
+    return 0;
+}
+
+BOOL WINAPI_CALL THETAZ_WinHttpQueryDataAvailable(void* hRequest, DWORD* lpdwNumberOfBytesAvailable) {
+    (void)hRequest;
+    if (lpdwNumberOfBytesAvailable) *lpdwNumberOfBytesAvailable = 0;
+    return 1;
+}
+
+BOOL WINAPI_CALL THETAZ_WinHttpReadData(void* hRequest, void* lpBuffer, DWORD dwNumberOfBytesToRead, DWORD* lpdwNumberOfBytesRead) {
+    (void)hRequest; (void)lpBuffer; (void)dwNumberOfBytesToRead;
+    if (lpdwNumberOfBytesRead) *lpdwNumberOfBytesRead = 0;
+    return 1;
+}
+
+BOOL WINAPI_CALL THETAZ_WinHttpReceiveResponse(void* hRequest, void* lpReserved) {
+    (void)hRequest; (void)lpReserved;
+    return 1;
+}
+
+BOOL WINAPI_CALL THETAZ_WinHttpSendRequest(void* hRequest, void* pHeaders, DWORD dwHeadersLength,
+    void* lpOptional, DWORD dwOptionalLength, DWORD dwTotalLength, DWORD_PTR dwContext) {
+    (void)hRequest; (void)pHeaders; (void)dwHeadersLength;
+    (void)lpOptional; (void)dwOptionalLength; (void)dwTotalLength; (void)dwContext;
+    return 1;
+}
+
+BOOL WINAPI_CALL THETAZ_WinHttpSetCredentials(void* hRequest, LPCWSTR AuthScheme, LPCWSTR pwszUserName,
+    LPCWSTR pwszPassword, void* pAuthParams) {
+    (void)hRequest; (void)AuthScheme; (void)pwszUserName; (void)pwszPassword; (void)pAuthParams;
+    return 1;
+}
+
+DWORD WINAPI_CALL THETAZ_waveOutGetNumDevs() {
+    return 0;
+
+
+// =========================================================================
+// Missing kernel32 implementations (added for executable linking)
+// =========================================================================
+
+FARPROC WINAPI_CALL THETAZ_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
+    if (!hModule || !lpProcName) return nullptr;
+    // Try to find in the module's export table
+    // For now, return nullptr - the loader handles this via the ApiRegistry
+    (void)hModule; (void)lpProcName;
+    return nullptr;
+}
+
+LPVOID WINAPI_CALL THETAZ_HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes) {
+    (void)hHeap;
+    if (dwBytes == 0) return nullptr;
+    LPVOID ptr = malloc(dwBytes);
+    if (ptr && (dwFlags & HEAP_ZERO_MEMORY)) {
+        memset(ptr, 0, dwBytes);
+    }
+    return ptr;
+}
+
+LPVOID WINAPI_CALL THETAZ_HeapReAlloc(HANDLE hHeap, DWORD dwFlags, LPVOID lpMem, SIZE_T dwBytes) {
+    (void)hHeap;
+    if (!lpMem) return THETAZ_HeapAlloc(nullptr, dwFlags, dwBytes);
+    if (dwBytes == 0) {
+        free(lpMem);
+        return nullptr;
+    }
+    LPVOID newPtr = realloc(lpMem, dwBytes);
+    if (newPtr && (dwFlags & HEAP_ZERO_MEMORY)) {
+        // Zero the newly allocated portion (approximate)
+        memset(newPtr, 0, dwBytes);
+    }
+    return newPtr;
+}
+
+BOOL WINAPI_CALL THETAZ_FreeLibraryWhenCallbackReturns(HMODULE hModule) {
+    (void)hModule;
+    return TRUE;
+}
+
+BOOL WINAPI_CALL THETAZ_InitializeProcThreadAttributeList(void)lpAttributeList; (void)dwAttributeCount; (void)dwFlags; (void)lpSize; {
+    (void)lpAttributeList; (void)dwAttributeCount; (void)dwFlags; (void)lpSize;
+    return FALSE;
+}
+
+BOOL WINAPI_CALL THETAZ_UpdateProcThreadAttribute(void)lpAttributeList; (void)dwFlags; (void)Attribute; (void)lpValue; (void)cbSize; (void)lpPreviousValue; (void)lpReturnSize; {
+    (void)lpAttributeList; (void)dwFlags; (void)Attribute; (void)lpValue; (void)cbSize; (void)lpPreviousValue; (void)lpReturnSize;
+    return FALSE;
+}
+
+BOOL WINAPI_CALL THETAZ_SetThreadpoolThreadMaximum(void)ptpp; (void)cthrdMost; {
+    (void)ptpp; (void)cthrdMost;
+    return TRUE;
+}
+
+BOOL WINAPI_CALL THETAZ_SetThreadpoolThreadMinimum(void)ptpp; (void)cthrdMic; {
+    (void)ptpp; (void)cthrdMic;
+    return TRUE;
+}
+
+BOOL WINAPI_CALL THETAZ_TrySubmitThreadpoolCallback(void)pfns; (void)pv; (void)pcbe; {
+    (void)pfns; (void)pv; (void)pcbe;
+    return FALSE;
+}
+
+// Path* W variants (from kernel32_batch.cpp)
+int WINAPI_CALL THETAZ_PathParseIconLocationW(LPWSTR pszIconPath) {
+    (void)pszIconPath;
+    return 0;
+}
+
+void WINAPI_CALL THETAZ_PathQuoteSpacesW(LPWSTR lpsz) {
+    (void)lpsz;
+}
+
+BOOL WINAPI_CALL THETAZ_PathRelativePathToW(LPWSTR pszPath, LPCWSTR pszFrom, DWORD dwAttrFrom, LPCWSTR pszTo, DWORD dwAttrTo) {
+    (void)pszPath; (void)pszFrom; (void)dwAttrFrom; (void)pszTo; (void)dwAttrTo;
+    return FALSE;
+}
+
+void WINAPI_CALL THETAZ_PathRemoveBackslashW(LPWSTR lpsz) {
+    if (lpsz) {
+        int l = wcslen(lpsz);
+        if (l > 0 && lpsz[l-1] == L'\\') lpsz[l-1] = L'\0';
+    }
+}
+
+void WINAPI_CALL THETAZ_PathRemoveBlanksW(LPWSTR lpsz) {
+    (void)lpsz;
+}
+
+void WINAPI_CALL THETAZ_PathRemoveExtensionW(LPWSTR lpsz) {
+    if (lpsz) {
+        wchar_t* dot = wcsrchr(lpsz, L'.');
+        if (dot && dot > wcsrchr(lpsz, L'\\')) *dot = L'\0';
+    }
+}
+
+BOOL WINAPI_CALL THETAZ_PathRemoveFileSpecW(LPWSTR lpsz) {
+    if (lpsz) {
+        wchar_t* s = wcsrchr(lpsz, L'\\');
+        if (!s) s = wcsrchr(lpsz, L'/');
+        if (s) *s = L'\0';
+    }
+    return TRUE;
+}
+
+BOOL WINAPI_CALL THETAZ_PathRenameExtensionW(LPWSTR lpsz, LPCWSTR pszExt) {
+    (void)lpsz; (void)pszExt;
+    return FALSE;
+}
+
+BOOL WINAPI_CALL THETAZ_PathSkipRootW(LPWSTR p) {
+    if (!p) return FALSE;
+    if (p[0] == L'\\' && p[1] == L'\\') {
+        wchar_t* s = p + 2;
+        while (*s && *s != L'\\') s++;
+        if (*s) s++;
+        while (*s && *s != L'\\') s++;
+        wcscpy(p, s);
+        return TRUE;
+    }
+    if (p[1] == L':') {
+        wcscpy(p, p + 3);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void WINAPI_CALL THETAZ_PathStripPathW(LPWSTR p) {
+    if (p) {
+        wchar_t* n = THETAZ_PathFindFileNameW(p);
+        if (n != p) wcscpy(p, n);
+    }
+}
+
+BOOL WINAPI_CALL THETAZ_PathStripToRootW(LPWSTR p) {
+    if (!p) return FALSE;
+    if (p[1] == L':') {
+        p[2] = L'\\';
+        p[3] = L'\0';
+        return TRUE;
+    }
+    if (p[0] == L'\\' && p[1] == L'\\') {
+        p[2] = L'\0';
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL WINAPI_CALL THETAZ_PathUnExpandEnvStringsW(LPCWSTR pszSrc, LPWSTR pszDst, UINT cchDst) {
+    if (pszDst && pszSrc && cchDst) {
+        wcsncpy(pszDst, pszSrc, cchDst);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void WINAPI_CALL THETAZ_PathUnquoteSpacesW(LPWSTR lpsz) {
+    (void)lpsz;
+}
+
+// =========================================================================
+// Missing threadpool/heap/GetProcAddress implementations
+// =========================================================================
+
+}
+

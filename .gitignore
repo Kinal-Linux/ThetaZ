@@ -1,0 +1,17 @@
+# Build output
+build/
+
+# Study references only — NOT part of the build
+Wine/
+ProtonGE/
+
+# Temporary/scratch files
+/tmp/
+*.out
+*.log
+
+# Editor/OS cruft
+*.swp
+*~
+.DS_Store
+*.bak
