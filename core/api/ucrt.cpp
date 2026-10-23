@@ -860,10 +860,11 @@ static int WINAPI_CALL ucrt___C_specific_handler(void* record_, void* frame_, vo
                                                  void* dispatch_) {
     constexpr uint32_t kExecHandler = 0xFFFFFFFF; // scope-table sentinel: accept unconditionally
     constexpr uint32_t kUnwindFlags = 0x6;        // EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND
-    constexpr uint32_t kDispTargetIp = 0x20;      // DISPATCHER_CONTEXT.TargetIp
-    constexpr uint32_t kDispImageBase = 0x08;     // DISPATCHER_CONTEXT.ImageBase
-    constexpr uint32_t kDispControlPc = 0x00;     // DISPATCHER_CONTEXT.ControlPc
-    constexpr uint32_t kDispHandlerData = 0x38;   // DISPATCHER_CONTEXT.HandlerData
+    // Field offsets come from the shared single source of truth (core/x86/x86.h).
+    const uint32_t kDispTargetIp = ThetaZ::seh::kDcTargetIp;
+    const uint32_t kDispImageBase = ThetaZ::seh::kDcImageBase;
+    const uint32_t kDispControlPc = ThetaZ::seh::kDcControlPc;
+    const uint32_t kDispHandlerData = ThetaZ::seh::kDcHandlerData;
 
     uint32_t record = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(record_));
     uint32_t frame = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(frame_));
@@ -945,7 +946,7 @@ static int WINAPI_CALL ucrt__except_handler3(void* record_, void* frame_, void* 
     uint32_t flags = *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(record + 4));
     constexpr uint32_t kUnwindFlags = 0x6;
     constexpr uint32_t kFOff = 8, kTOff = 12, kEbpoff = 16;
-    constexpr uint32_t kDispTargetIp = 0x20;
+    const uint32_t kDispTargetIp = ThetaZ::seh::kDcTargetIp;
     constexpr uint32_t kCtxEip = 0xB8, kCtxEbp = 0xB4;
 
     uint32_t scopetable = *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(frame + kFOff));
@@ -1028,7 +1029,7 @@ static int WINAPI_CALL ucrt__except_handler4_common(void* cookie_, void* check_c
     uint32_t flags = *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(record + 4));
     constexpr uint32_t kUnwindFlags = 0x6;
     constexpr uint32_t kFOff = 8, kTOff = 12, kEbpoff = 16;
-    constexpr uint32_t kDispTargetIp = 0x20;
+    const uint32_t kDispTargetIp = ThetaZ::seh::kDcTargetIp;
     constexpr uint32_t kCtxEip = 0xB8, kCtxEbp = 0xB4;
     constexpr uint32_t kTryEnd = 0xFFFFFFFEu; // -2
 
@@ -1307,7 +1308,15 @@ static int WINAPI_CALL ucrt___CxxFrameHandler(void* record_, void* frame_, void*
             *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ctx + kCtxEsp)) = frame;
             *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ctx + kCtxEdx)) =
                 p_object + static_cast<uint32_t>(sub_disp);
-            (void)disp;
+            // Report the continuation through DISPATCHER_CONTEXT.TargetIp as
+            // well: the dispatcher's acceptance test reads it, and a real MSVC
+            // handler reading this context expects the documented offset.
+            if (disp) {
+                *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(
+                    disp + ThetaZ::seh::kDcTargetIp)) = funclet;
+                *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(
+                    disp + ThetaZ::seh::kDcContextRecord)) = ctx;
+            }
             return 1; // EXCEPTION_EXECUTE_HANDLER
         }
     }

@@ -124,6 +124,38 @@ uint32_t x86_call_guest_args(uint32_t fn, const uint32_t* args, int nargs);
 // Variant that overrides the guest EBP before the call (MSVC SEH filters and
 // __finally blocks run with the frame's saved EBP). ebp == 0 keeps the caller's.
 uint32_t x86_call_guest_args_ebp(uint32_t fn, const uint32_t* args, int nargs, uint32_t ebp);
+// Variant that also seeds EAX. MSVC's x86 C++ handler chain receives this
+// function's FuncInfo in EAX (the per-function stub loads it, __CxxFrameHandler3
+// forwards it as a fifth argument), so a real MSVC guest handler needs EAX set
+// or it cannot find its try/catch data. eax_value == 0 delegates to the
+// x86_call_guest_args_ebp behaviour and keeps classic __except_handler3/4
+// paths unchanged.
+uint32_t x86_call_guest_handler(uint32_t fn, const uint32_t* args, int nargs,
+                                uint32_t eax_value);
+
+// ---------------------------------------------------------------------------
+// Win32 DISPATCHER_CONTEXT offsets (32-bit layout, verified against the real
+// MSVC __CxxFrameHandler3 in vcruntime140.dll).
+//
+// This is the SINGLE SOURCE OF TRUTH for the struct the emulator builds in
+// guest memory before invoking an exception handler. The previous code wrote
+// its own private offsets, so a real MSVC guest handler read HandlerData as
+// zero and silently returned ExceptionContinueSearch.
+//
+// Layout (8 x 32-bit fields => 0x20 bytes total).
+// ---------------------------------------------------------------------------
+namespace seh {
+constexpr uint32_t kDcControlPc       = 0x00; // ControlPc (RVA/VA of the fault)
+constexpr uint32_t kDcImageBase       = 0x04; // ImageBase of the faulting image
+constexpr uint32_t kDcFunctionEntry   = 0x08; // RUNTIME_FUNCTION*
+constexpr uint32_t kDcEstablisherFrame= 0x0C; // EstablisherFrame (the SEH record)
+constexpr uint32_t kDcTargetIp        = 0x10; // continuation address chosen
+constexpr uint32_t kDcContextRecord   = 0x14; // CONTEXT*
+constexpr uint32_t kDcLanguageHandler = 0x18; // PEXCEPTION_ROUTINE
+constexpr uint32_t kDcHandlerData     = 0x1C; // FuncInfo / scopetable
+constexpr uint32_t kDcSize            = 0x20;
+static_assert(kDcHandlerData + 4 == kDcSize, "x86 DISPATCHER_CONTEXT is 0x20 bytes");
+} // namespace seh
 
 // A guest SEH handler (__except_handler3 / __CxxFrameHandler) claimed an
 // exception and rewrote the guest context (Eip/Esp/Ebp/Edx) to continue in

@@ -1564,6 +1564,19 @@ DWORD WINAPI_CALL THETAZ_GetCurrentDirectoryA(DWORD nBufferLength, LPSTR lpBuffe
 // ---------------------------------------------------------------------------
 static bool maps_range_readable(uintptr_t start, size_t len);
 
+// True when a frame's third word is a C++ FuncInfo (first field is one of the
+// EH magics) rather than a classic SEH scope table. MSVC's x86 C++ handler
+// chain needs that FuncInfo in EAX; a classic __except_handler3/4 frame's third
+// word is a scope table and seeding it would corrupt the handler's inputs.
+// The pointer is validated before it is dereferenced: a frame record's third
+// word can hold anything, and dereferencing garbage would take down the host
+// (this crashed the process during bring-up).
+static bool looks_like_func_info(uint32_t p) {
+    if (p < 0x400000u || !maps_range_readable(p, 4)) return false;
+    uint32_t magic = *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(p));
+    return magic == 0x19930520u || magic == 0x19930521u || magic == 0x19930522u;
+}
+
 // MSVC x86 SEH registration nodes come in two layouts in practice:
 //
 //   4-word node (FuncInfo-style, node at [ebp-0x10]):
@@ -1737,7 +1750,14 @@ void WINAPI_CALL THETAZ_RaiseException(DWORD code, DWORD flags, DWORD nargs, voi
     w32(rec + 0x08, 0);        // ExceptionRecord (nested)
     w32(rec + 0x0C, fault_pc); // ExceptionAddress
     w32(rec + 0x10, nargs);
-    if (args_guest) {
+    // EXCEPTION_RECORD.ExceptionInformation is a FIXED 15-slot array (60 bytes).
+    // Windows raises with 3 parameters for a C++ throw, yet MSVC's
+    // __CxxFrameHandler reads ExceptionInformation[3] and bails out when it is
+    // nonzero ("cmp [record+0x1C],0; jne decline"). Leaving the slots past
+    // nargs as recycled guest-buffer garbage made every C++ handler decline the
+    // exception, so clear the whole array first and then copy the real args.
+    memset(reinterpret_cast<void*>(static_cast<uintptr_t>(rec + 0x14)), 0, 15 * 4);
+    if (args_guest && nargs) {
         memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(rec + 0x14)),
                reinterpret_cast<void*>(static_cast<uintptr_t>(args_guest)), nargs * 4);
     }
@@ -1835,6 +1855,12 @@ void WINAPI_CALL THETAZ_RaiseException(DWORD code, DWORD flags, DWORD nargs, voi
     // Only the innermost frame corresponds to the faulting instruction. Outer
     // frames are reached through the caller's EBP and use its return address.
     bool first_handler = true;
+    // Set by call_handler when a handler changed the context's Eip away from
+    // this frame's control PC: that is the observable proof it accepted, and it
+    // is the only signal that works for a guest's own MSVC handler (whose
+    // disposition values follow the EXCEPTION_DISPOSITION enum, where 0 means
+    // ExceptionContinueSearch — the opposite of what this code assumed).
+    bool handler_rewrote_context = false;
     auto call_handler = [&](uint32_t frame, uint32_t& inner_ebp) -> uint32_t {
         uint32_t handler = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(frame + 4)));
         if (!handler || handler == 0xFFFFFFFFu) return 0;
@@ -1862,18 +1888,52 @@ void WINAPI_CALL THETAZ_RaiseException(DWORD code, DWORD flags, DWORD nargs, voi
         uint32_t handler_data = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(frame + 8)));
         w32(ctx + 0xB8, control_pc);
         w32(ctx + 0xB4, context_ebp);
-        w32(disp + 0x00, control_pc);
-        w32(disp + 0x04, ctx);
-        w32(disp + 0x08, image_base_for_address(control_pc));
-        w32(disp + 0x10, frame);
-        w32(disp + 0x20, 0);
-        w32(disp + 0x38, handler_data);
+        // Build the guest-visible DISPATCHER_CONTEXT at the real Win32 field
+        // offsets (see seh:: in core/x86/x86.h). A real MSVC guest handler
+        // reads HandlerData from +0x1C; writing it past the end of the struct
+        // left it zero and every C++ handler declined the exception.
+        w32(disp + seh::kDcControlPc, control_pc);
+        w32(disp + seh::kDcImageBase, image_base_for_address(control_pc));
+        w32(disp + seh::kDcFunctionEntry, 0);      // no RUNTIME_FUNCTION for PE
+        w32(disp + seh::kDcEstablisherFrame, frame);
+        w32(disp + seh::kDcTargetIp, 0);           // filled by the handler
+        w32(disp + seh::kDcContextRecord, ctx);
+        w32(disp + seh::kDcLanguageHandler, handler);
+        w32(disp + seh::kDcHandlerData, handler_data);
         uint32_t hargs[4] = { rec, frame, ctx, disp };
+        // MSVC's x86 C++ handler chain expects this function's FuncInfo in EAX.
+        // For a classic __except_handler3/4 frame the third word is a scope
+        // table, not a FuncInfo, and seeding it would be wrong: only pass it
+        // when it looks like a FuncInfo (magic in the first field).
+        uint32_t eax_seed = looks_like_func_info(handler_data) ? handler_data : 0;
         if (seh_trace) {
-            fprintf(stderr, "[seh] call handler=0x%08X frame=0x%08X control=0x%08X%s\n",
-                    handler, frame, control_pc, (hardware_guest && is_first) ? " (hardware)" : "");
+            fprintf(stderr, "[seh] call handler=0x%08X frame=0x%08X control=0x%08X%s hdata=0x%08X eax=0x%08X\n",
+                    handler, frame, control_pc, (hardware_guest && is_first) ? " (hardware)" : "",
+                    handler_data, eax_seed);
+            if (maps_range_readable(rec, 0x20)) {
+                auto rd = [](uint32_t a) { return *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(a)); };
+                fprintf(stderr, "   [seh] record: code=0x%08X flags=0x%08X nargs=%u "
+                        "info[0]=0x%08X info[1]=0x%08X info[2]=0x%08X info[3]=0x%08X\n",
+                        rd(rec), rd(rec + 4), rd(rec + 0x10), rd(rec + 0x14),
+                        rd(rec + 0x18), rd(rec + 0x1C), rd(rec + 0x20));
+            }
+            if (maps_range_readable(disp, seh::kDcSize)) {
+                auto rd = [](uint32_t a) { return *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(a)); };
+                fprintf(stderr, "   [seh] dispCtx: pc=0x%08X img=0x%08X fe=0x%08X est=0x%08X "
+                        "target=0x%08X ctx=0x%08X lang=0x%08X hdata=0x%08X\n",
+                        rd(disp + seh::kDcControlPc), rd(disp + seh::kDcImageBase),
+                        rd(disp + seh::kDcFunctionEntry), rd(disp + seh::kDcEstablisherFrame),
+                        rd(disp + seh::kDcTargetIp), rd(disp + seh::kDcContextRecord),
+                        rd(disp + seh::kDcLanguageHandler), rd(disp + seh::kDcHandlerData));
+            }
         }
-        uint32_t disposition = x86_call_guest_args(handler, hargs, 4);
+        // Context Eip as this handler found it: it must match the control PC we
+        // just wrote, so comparing after the call detects a rewrite.
+        const uint32_t ctx_eip_before = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ctx + 0xB8)));
+        uint32_t disposition = x86_call_guest_handler(handler, hargs, 4, eax_seed);
+        const uint32_t ctx_eip_after = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ctx + 0xB8)));
+        handler_rewrote_context =
+            (ctx_eip_after != ctx_eip_before) || (ctx_eip_after != control_pc);
         if (seh_trace) {
             fprintf(stderr, "[seh] handler=0x%08X returned 0x%08X\n", handler, disposition);
         }
@@ -1900,7 +1960,7 @@ void WINAPI_CALL THETAZ_RaiseException(DWORD code, DWORD flags, DWORD nargs, voi
         X86SehResume& seh_pre = x86_seh_resume_state();
         if (seh_pre.active) return;
         uint32_t disposition = call_handler(frame, inner_ebp);
-        uint32_t target = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(disp + 0x20)));
+        uint32_t target = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(disp + seh::kDcTargetIp)));
         if (seh_trace) {
             fprintf(stderr, "[seh] pass1 frame=0x%08X handler=0x%08X disp=0x%X target=0x%08X ctxeip=0x%08X ctxesp=0x%08X ctxebp=0x%08X\n",
                     frame, handler, (unsigned)disposition, target,
@@ -1910,12 +1970,19 @@ void WINAPI_CALL THETAZ_RaiseException(DWORD code, DWORD flags, DWORD nargs, voi
         }
         X86SehResume& seh = x86_seh_resume_state();
         if (seh.active) return; // handler unwound and chose a resume point
-        // Standard x86 SEH: ExceptionContinueExecution (0) means the handler
-        // claimed the exception and rewrote the context. ThetaZ's own table
-        // handlers additionally report their continuation through
-        // DISPATCHER_CONTEXT.TargetIp while returning ExceptionContinueSearch
-        // (1); treat a nonzero TargetIp on disposition 1 as accepted too.
-        if (disposition == 0 || (disposition == 1 && target != 0)) {
+        // A handler "accepts" when it rewrites the context to continue
+        // somewhere else, reports EXCEPTION_CONTINUE_EXECUTION (0xFFFFFFFF), or
+        // — ThetaZ's own table handlers' convention — returns
+        // EXCEPTION_EXECUTE_HANDLER (1) with a nonzero TargetIp. Plain
+        // EXCEPTION_DISPOSITION 0/2/3 mean keep searching; note 0 is
+        // ExceptionContinueSearch, NOT acceptance, which is why the context
+        // rewrite check carries the decision for a guest's own MSVC handler.
+        // A bare disposition of 1 with an untouched context is deliberately not
+        // accepted: resuming at the fault PC would loop forever.
+        const bool accepted =
+            handler_rewrote_context || disposition == 0xFFFFFFFF ||
+            (disposition == 1 && target != 0);
+        if (accepted) {
             accepting = frame;
             break;
         }
@@ -1946,7 +2013,7 @@ void WINAPI_CALL THETAZ_RaiseException(DWORD code, DWORD flags, DWORD nargs, voi
     w32(rec + 0x04, flags);
 
     // Resume at the accepting handler's continuation.
-    uint32_t resume_eip = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(disp + 0x20)));
+    uint32_t resume_eip = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(disp + seh::kDcTargetIp)));
     if (!resume_eip) resume_eip = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ctx + 0xB8)));
     uint32_t resume_esp = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ctx + 0xC4)));
     uint32_t resume_ebp = *(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(ctx + 0xB4)));
@@ -3300,14 +3367,21 @@ void WINAPI_CALL THETAZ_RtlUnwind(void* target_frame, void* target_ip, void* rec
             };
             w32(ctx + 0xB8, control_pc);
             w32(ctx + 0xB4, saved_ebp);
-            w32(disp + 0x00, control_pc);
-            w32(disp + 0x04, ctx);
-            w32(disp + 0x08, image_base_for_address(control_pc));
-            w32(disp + 0x10, frame);
-            w32(disp + 0x20, tip);
-            w32(disp + 0x38, *(uint32_t*)(uintptr_t)(frame + 8));
+            // Same real Win32 DISPATCHER_CONTEXT layout as the dispatch path
+            // (see seh:: in core/x86/x86.h). During an unwind TargetIp carries
+            // the continuation address the unwind is heading for.
+            uint32_t unwind_hdata = *(uint32_t*)(uintptr_t)(frame + 8);
+            w32(disp + seh::kDcControlPc, control_pc);
+            w32(disp + seh::kDcImageBase, image_base_for_address(control_pc));
+            w32(disp + seh::kDcFunctionEntry, 0);
+            w32(disp + seh::kDcEstablisherFrame, frame);
+            w32(disp + seh::kDcTargetIp, tip);
+            w32(disp + seh::kDcContextRecord, ctx);
+            w32(disp + seh::kDcLanguageHandler, handler);
+            w32(disp + seh::kDcHandlerData, unwind_hdata);
             uint32_t hargs[4] = { rec, frame, ctx, disp };
-            uint32_t disposition = x86_call_guest_args(handler, hargs, 4);
+            uint32_t eax_seed = looks_like_func_info(unwind_hdata) ? unwind_hdata : 0;
+            uint32_t disposition = x86_call_guest_handler(handler, hargs, 4, eax_seed);
             if (unwind_trace) {
                 fprintf(stderr, "[seh] unwind frame=0x%08X handler=0x%08X eip=0x%08X ebp=0x%08X disp=0x%X\n",
                         frame, handler, control_pc, saved_ebp, disposition);

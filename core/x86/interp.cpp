@@ -4555,6 +4555,38 @@ uint32_t x86_call_guest_args_ebp(uint32_t fn, const uint32_t* args, int nargs, u
     return cb.regs[XR_EAX];
 }
 
+// Invoke a guest exception handler with EAX seeded. MSVC's x86 C++ handler
+// chain does not take its FuncInfo from the DISPATCHER_CONTEXT: the
+// per-function stub loads EAX with that function's FuncInfo, __CxxFrameHandler3
+// forwards it as a fifth argument, and the internal reads it from [ebp+0x18].
+// Passing only the four stack arguments (what x86_call_guest_args_ebp does)
+// leaves EAX undefined, so a real MSVC guest handler has no try/catch data and
+// returns ExceptionContinueSearch. eax_value == 0 leaves EAX untouched, which
+// keeps the classic __except_handler3/4 path behaving as before.
+uint32_t x86_call_guest_handler(uint32_t fn, const uint32_t* args, int nargs,
+                                uint32_t eax_value) {
+    if (eax_value == 0) return x86_call_guest_args_ebp(fn, args, nargs, 0);
+    if (!g_fault_state) return 0;
+    const uint32_t sentinel = 0xCA11B001u;
+    X86CpuState cb = *g_fault_state;
+    cb.halted = false;
+    cb.eip = fn;
+    cb.regs[XR_EAX] = eax_value;
+    uint32_t esp = cb.regs[XR_ESP];
+    for (int i = nargs - 1; i >= 0; i--) {
+        esp -= 4;
+        mw32(esp, args[i]);
+    }
+    esp -= 4;
+    mw32(esp, sentinel);
+    cb.regs[XR_ESP] = esp;
+
+    g_callback_sentinel = sentinel;
+    x86_run(cb, {});
+    g_callback_sentinel = x86_prev_callback_sentinel();
+    return cb.regs[XR_EAX];
+}
+
 // Save the current callback sentinel: nested callbacks (an API dispatched
 // from inside another callback) must restore the OUTER sentinel on exit so the
 // outer callback's RET still halts. Previously the nested callback cleared it,
