@@ -83,6 +83,18 @@ UINT WINAPI_CALL THETAZ_GetSystemDirectoryA(char* buf, UINT size) {
     const char* d="C:\\Windows\\System32"; size_t l=strlen(d);
     if(buf&&size>l) strcpy(buf,d); return (UINT)l;
 }
+UINT WINAPI_CALL THETAZ_GetSystemDirectoryW(uint16_t* buf, UINT size) {
+    // 32-bit WOW64 guests report the syswow64 directory, matching the
+    // GetSystemDirectoryW behaviour Office's bootstrap relies on to locate
+    // its own DLLs. The emulated prefix has no such directories; report the
+    // emulated C:\Windows\SysWOW64 so the returned length is consistent.
+    const wchar_t* d=L"C:\\Windows\\SysWOW64"; size_t l=19;
+    if(buf&&size>l){for(size_t i=0;i<=l;i++)buf[i]=d[i];}
+    // Buffer too small (or NULL query): return the required length so the
+    // caller retries with a larger buffer, as Windows documents.
+    else if(buf&&size<=l) return (UINT)l+1;
+    return (UINT)l;
+}
 UINT WINAPI_CALL THETAZ_GetWindowsDirectoryA(char* buf, UINT size) {
     const char* d="C:\\Windows"; size_t l=strlen(d);
     if(buf&&size>l) strcpy(buf,d); return (UINT)l;
@@ -907,6 +919,9 @@ void initialize_kernel32_batch() {
     register_api("KERNEL32.dll", "GetLogicalDrives", (void*)THETAZ_GetLogicalDrives);
     register_api("kernel32.dll", "GetSystemDirectoryA", (void*)THETAZ_GetSystemDirectoryA);
     register_api("KERNEL32.dll", "GetSystemDirectoryA", (void*)THETAZ_GetSystemDirectoryA);
+    register_api("kernel32.dll", "GetSystemDirectoryW", (void*)THETAZ_GetSystemDirectoryW);
+    register_api("KERNEL32.dll", "GetSystemDirectoryW", (void*)THETAZ_GetSystemDirectoryW);
+    register_api("kernelbase.dll", "GetSystemDirectoryW", (void*)THETAZ_GetSystemDirectoryW);
     register_api("kernel32.dll", "GetWindowsDirectoryA", (void*)THETAZ_GetWindowsDirectoryA);
     register_api("KERNEL32.dll", "GetWindowsDirectoryA", (void*)THETAZ_GetWindowsDirectoryA);
     register_api("kernel32.dll", "GetWindowsDirectoryW", (void*)THETAZ_GetWindowsDirectoryW);

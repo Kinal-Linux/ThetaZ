@@ -42,6 +42,11 @@ struct Thunk {
     ffi_cif cif{};
     ffi_type* arg_types[24] = {};
     bool in_use = false;
+    // One-shot diagnostic latch: the first call through this thunk reports an
+    // unknown signature (no argc guarantee) under THETAZ_TRACE_UNKSIG.
+    bool logged = false;
+    // True once the call-site push-run inference has run for this thunk.
+    bool inferred = false;
     // Owned string copies: info.dll/info.name may point into a guest image
     // (which is unmapped when that process exits) or a caller's stack buffer.
     // Thunks are shared across processes, so they must own their strings.
@@ -240,12 +245,14 @@ const SigEntry kSignatures[] = {
     ST("kernel32.dll", "GetStringTypeExA", 4),
     ST("kernel32.dll", "GetSystemDefaultLCID", 0),
     ST("kernel32.dll", "GetSystemDefaultLocaleName", 2),
+    ST("kernel32.dll", "GetSystemDirectoryA", 2),
     ST("kernel32.dll", "GetSystemDirectoryW", 2),
     ST("kernel32.dll", "GetSystemInfo", 1),
     ST("kernel32.dll", "GetSystemPowerStatus", 1),
     ST("kernel32.dll", "GetSystemPreferredUILanguages", 4),
     ST("kernel32.dll", "GetSystemTime", 1),
     ST("kernel32.dll", "GetSystemTimeAsFileTime", 1),
+    ST("kernel32.dll", "GetSystemTimePreciseAsFileTime", 1),
     ST("kernel32.dll", "GetTempFileNameW", 4),
     ST("kernel32.dll", "GetTempPathA", 2),
     ST("kernel32.dll", "GetTempPathW", 2),
@@ -449,7 +456,9 @@ const SigEntry kSignatures[] = {
     ST("advapi32.dll", "LsaNtStatusToWinError", 1),
     ST("advapi32.dll", "LsaQueryInformationPolicy", 3),
     ST("advapi32.dll", "LsaEnumerateLogonSessions", 2),
-    ST("shell32.dll", "CommandLineToArgvW", 2),    ST("ws2_32.dll", "WSAStartup", 2),
+    ST("shell32.dll", "CommandLineToArgvW", 2),
+    ST("shell32.dll", "SHGetFolderPathW", 5),
+    ST("ws2_32.dll", "WSAStartup", 2),
     ST("ws2_32.dll", "WSACleanup", 0),
     ST("ws2_32.dll", "WSAGetLastError", 0),
     ST("ws2_32.dll", "WSASetLastError", 1),
@@ -947,6 +956,9 @@ const SigEntry kSignatures[] = {
     ST("user32.dll", "GetIconInfo", 2),
     ST("user32.dll", "GetKeyNameTextW", 3),
     ST("user32.dll", "GetKeyState", 1),
+    ST("user32.dll", "GetKeyboardLayoutList", 2),
+    ST("user32.dll", "RegisterWindowMessageA", 1),
+    ST("user32.dll", "MsgWaitForMultipleObjects", 5),
     ST("user32.dll", "GetMenuState", 3),
     ST("user32.dll", "GetMessagePos", 0),
     ST("user32.dll", "GetMessageTime", 0),
@@ -1029,6 +1041,8 @@ const SigEntry kSignatures[] = {
     ST("kernel32.dll", "CompareStringOrdinal", 4),
     ST("kernel32.dll", "IsBadCodePtr", 1),
     ST("kernel32.dll", "IsBadStringPtrA", 2),
+    ST("kernel32.dll", "IsBadStringPtrW", 2),
+    ST("kernel32.dll", "QueryActCtxW", 7),
     ST("kernel32.dll", "IsBadWritePtr", 2),
     ST("kernel32.dll", "GlobalAddAtomW", 1),
     ST("kernel32.dll", "GlobalDeleteAtom", 1),
@@ -1406,6 +1420,219 @@ static inline uint32_t guest_mr32(uint32_t a) {
     return *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(a));
 }
 
+// ---------------------------------------------------------------------------
+// Call-site argument-count inference.
+//
+// The signature table is hand-authored, so a registered implementation without
+// a row still gets a thunk whose argc was never verified: the guest's pushed
+// arguments are neither passed to the host function nor popped afterwards. That
+// was the root cause of several guest faults (garbage values reaching refcount
+// releases) and of stack exhaustion in polling loops.
+//
+// Rather than trusting the imputed count, decode the caller. An MSVC-compiled
+// stdcall import call site looks like
+//
+//     push argN ; ... ; push arg2 ; push arg1 ; call [IAT]
+//
+// so a maximal backwards run of pushes immediately before the call instruction
+// yields the true argument count. Only pushes that END at the call are counted,
+// and the scan stops at the first byte that is not a push, so intervening
+// instructions terminate the run instead of inflating the count.
+//
+// Returns 0 when the site does not use a push run (e.g. arguments written via
+// `sub esp,N` + `mov [esp+k]`), which keeps the previous behaviour as the
+// fallback rather than inventing a count.
+// ---------------------------------------------------------------------------
+
+// Length of the call/jmp instruction that ends at ret_addr, or 0 if unknown.
+static uint32_t call_insn_length_ending_at(uint32_t ret_addr) {
+    auto u8 = [](uint32_t a) { return static_cast<uint8_t>(guest_mr32(a) & 0xFF); };
+    // Direct near call/jmp rel32 (E8/E9), 5 bytes.
+    if (ret_addr >= 5 && (u8(ret_addr - 5) == 0xE8u || u8(ret_addr - 5) == 0xE9u)) return 5;
+    // Indirect FF /2 (call) or FF /4 (jmp) with r/m32.
+    if (ret_addr >= 6 && u8(ret_addr - 6) == 0xFFu) {
+        uint8_t modrm = u8(ret_addr - 5);
+        if (((modrm >> 3) & 7) == 2 || ((modrm >> 3) & 7) == 4) {
+            uint8_t mod = (modrm >> 6) & 3;
+            if (mod == 0 && (modrm & 7) == 5) return 6;   // FF /x [disp32]
+            if (mod == 1) return 7;                        // FF /x [disp8]
+            if (mod == 2) return 10;                       // FF /x [disp32] + sib
+        }
+    }
+    if (ret_addr >= 3 && u8(ret_addr - 3) == 0xFFu) {
+        uint8_t modrm = u8(ret_addr - 2);
+        if (((modrm >> 3) & 7) == 2 || ((modrm >> 3) & 7) == 4) {
+            uint8_t mod = (modrm >> 6) & 3;
+            uint8_t rm = modrm & 7;
+            if (mod == 0 && rm != 5) return 3;             // FF /x [reg] (+ sib)
+        }
+    }
+    if (ret_addr >= 2 && u8(ret_addr - 2) == 0xFFu) {
+        uint8_t modrm = u8(ret_addr - 1);
+        if (((modrm >> 3) & 7) == 2 || ((modrm >> 3) & 7) == 4) {
+            uint8_t mod = (modrm >> 6) & 3;
+            uint8_t rm = modrm & 7;
+            if (rm == 4) return 3;                         // FF /x [esp] (sib, mod=0)
+            if (mod == 0 && rm != 5) return 2;             // FF /x reg
+            if (mod == 1) return 3;                        // FF /x [reg+disp8]
+            if (mod == 2) return 6;                        // FF /x [reg+disp32]
+        }
+    }
+    return 0;
+}
+
+// Length of the push instruction ending at p+1 (its last byte is [p]), or 0.
+static uint32_t push_insn_length_ending_at(uint32_t p) {
+    if (p < 0x40000000u) return 0;
+    uint8_t op = guest_mr32(p) & 0xFF;
+    if (op >= 0x50 && op <= 0x57) return 1;      // push reg
+    if (op == 0x68) return 5;                    // push imm32
+    if (op == 0x6A) return 2;                    // push imm8
+    if (op == 0xFF) {                            // push r/m32 (FF /6)
+        if (p == 0) return 0;
+        uint8_t modrm = guest_mr32(p - 1) & 0xFF;
+        if (((modrm >> 3) & 7) != 6) return 0;
+        uint8_t mod = (modrm >> 6) & 3;
+        uint8_t rm = modrm & 7;
+        if (rm == 4) return 3 + ((mod == 1) ? 1 : ((mod == 2) ? 4 : 0));
+        if (rm == 5 && mod == 0) return 6;
+        if (mod == 0) return 2;
+        if (mod == 1) return 3;
+        if (mod == 2) return 6;
+    }
+    return 0;
+}
+
+// Matches "mov dword [esp+K], src" ending at `end` (its last byte is [end-1]).
+// Covers dword stores from a register (89 /r, no immediate) and from an
+// immediate (C7 /0, imm32 trailing), with disp8, disp32 or no displacement.
+// Returns the instruction length and writes the esp-relative displacement to
+// *k_out; returns 0 for no match.
+static uint32_t decode_mov_esp_disp(uint32_t end, uint32_t* k_out) {
+    if (end < 8) return 0;
+    auto u8 = [](uint32_t a) { return static_cast<uint8_t>(guest_mr32(a) & 0xFF); };
+    auto u32 = [](uint32_t a) { return guest_mr32(a); };
+    // modrm must address esp with no index register: SIB scale 0, base 100 (esp).
+    auto esp_dest = [&](uint32_t modrm_pos, uint8_t* mod_out) -> bool {
+        uint8_t modrm = u8(modrm_pos);
+        uint8_t mod = (modrm >> 6) & 3;
+        if ((modrm & 7) != 4) return false;       // base register must be esp
+        if (mod == 0 || mod == 1 || mod == 2) { *mod_out = mod; return true; }
+        return false;
+    };
+
+    // 89 modrm sib disp8 : mov [esp+disp8], reg   (last byte is disp8)
+    if (u8(end - 4) == 0x89) {
+        uint8_t mod = 0;
+        if (u8(end - 2) == 0x24 && esp_dest(end - 3, &mod) && mod == 1) {
+            *k_out = u8(end - 1);
+            return 4;
+        }
+    }
+    // 89 modrm sib : mov [esp], reg              (last byte is the SIB)
+    if (u8(end - 3) == 0x89) {
+        uint8_t mod = 0;
+        if (u8(end - 1) == 0x24 && esp_dest(end - 2, &mod) && mod == 0) {
+            *k_out = 0;
+            return 3;
+        }
+    }
+    // 89 modrm sib disp32 : mov [esp+disp32], reg
+    if (u8(end - 7) == 0x89) {
+        uint8_t mod = 0;
+        if (u8(end - 5) == 0x24 && esp_dest(end - 6, &mod) && mod == 2) {
+            *k_out = u32(end - 4);
+            return 7;
+        }
+    }
+    // C7 modrm sib disp8 imm32 : mov [esp+disp8], imm32  (imm32 is last)
+    if (u8(end - 8) == 0xC7) {
+        uint8_t mod = 0;
+        if (u8(end - 6) == 0x24 && esp_dest(end - 7, &mod) && mod == 1) {
+            *k_out = u8(end - 5);
+            return 8;
+        }
+    }
+    // C7 modrm sib imm32 : mov [esp], imm32
+    if (u8(end - 7) == 0xC7) {
+        uint8_t mod = 0;
+        if (u8(end - 5) == 0x24 && esp_dest(end - 6, &mod) && mod == 0) {
+            *k_out = 0;
+            return 7;
+        }
+    }
+    // C7 modrm sib disp32 imm32 : mov [esp+disp32], imm32
+    if (u8(end - 11) == 0xC7) {
+        uint8_t mod = 0;
+        if (u8(end - 9) == 0x24 && esp_dest(end - 10, &mod) && mod == 2) {
+            *k_out = u32(end - 8);
+            return 11;
+        }
+    }
+    return 0;
+}
+
+// If the guest cleans the call's arguments itself (`add esp, imm` at ret_addr)
+// the import is cdecl and the argument count is exactly that immediate. This is
+// how GCC-built code (Wine DLLs, CRT functions) calls variadic imports: the
+// callee must NOT pop, or the caller's own cleanup pops past the arguments and
+// corrupts the stack. Returns 0 when the instruction is not a caller cleanup.
+static uint32_t infer_cdecl_cleanup_argc(uint32_t ret_addr) {
+    if (ret_addr < 3) return 0;
+    auto u8 = [](uint32_t a) { return static_cast<uint8_t>(guest_mr32(a) & 0xFF); };
+    auto u32 = [](uint32_t a) { return guest_mr32(a); };
+    if (u8(ret_addr - 3) == 0x83u && u8(ret_addr - 2) == 0xC4u) {
+        // add esp, imm8
+        uint32_t n = u8(ret_addr - 1);
+        return (n >= 4 && (n & 3) == 0 && n <= 64) ? n / 4 : 0;
+    }
+    if (ret_addr >= 6 && u8(ret_addr - 6) == 0x81u && u8(ret_addr - 5) == 0xC4u) {
+        // add esp, imm32
+        uint32_t n = u32(ret_addr - 4);
+        return (n >= 4 && (n & 3) == 0 && n <= 256) ? n / 4 : 0;
+    }
+    return 0;
+}
+
+static uint32_t infer_argc_from_call_site(uint32_t ret_addr) {
+    uint32_t call_len = call_insn_length_ending_at(ret_addr);
+    if (call_len == 0 || call_len >= ret_addr) return 0;
+    // Walk back over the contiguous push run that feeds this call. Cap at the
+    // widest Win32 calling convention this project supports (16 slots).
+    uint32_t p = ret_addr - call_len;
+    uint32_t argc = 0;
+    while (argc < 16) {
+        uint32_t len = push_insn_length_ending_at(p - 1);
+        if (len == 0 || len > p) break;
+        argc += 1;
+        p -= len;
+    }
+    if (argc > 0) return argc;
+
+    // No push run: the caller may write the argument block in place with
+    // `mov dword [esp+K], src` (MinGW's call-through-IAT shape, also emitted by
+    // MSVC for wide frames). Recover the block from those writes: the run must
+    // start at [esp+0] and be contiguous, so the highest slot written bounds
+    // the argument count.
+    bool seen[16] = {};
+    uint32_t max_slot = 0;
+    while (argc < 16) {
+        uint32_t k = 0;
+        uint32_t len = decode_mov_esp_disp(p, &k);
+        if (len == 0 || len > p || (k & 3) != 0 || k / 4 >= 16) break;
+        seen[k / 4] = true;
+        if (k / 4 > max_slot) max_slot = k / 4;
+        argc++;
+        p -= len;
+    }
+    if (argc == 0 || !seen[0]) return 0;
+    for (uint32_t i = 0; i <= max_slot; i++) {
+        if (!seen[i]) return 0;   // gap in the block: not an argument setup
+    }
+    return (max_slot + 1) * 4 / 4; // slots => 32-bit words
+}
+
+
 // Allocate a thunk for a function resolved at runtime (GetProcAddress). The
 // signature table is consulted by name so the marshalling is correct.
 uint32_t x86_alloc_proc_thunk(void* fn, const char* name) {
@@ -1666,10 +1893,55 @@ uint32_t x86_dispatch_api(X86CpuState& s, uint32_t thunk_addr, uint32_t ret_addr
     Thunk& t = g_thunks[idx];
     const SigEntry* sig = find_sig(t.info.dll, t.info.name);
 
+    if (!t.info.known && !t.logged) {
+        // First call through an imputed-signature thunk. argc was never verified
+        // against the real export, so the guest's arguments may be neither read
+        // nor popped correctly; this is the leading suspect for the observed
+        // stack corruption (garbage pointers reaching refcount releases).
+        t.logged = true;
+        if (getenv("THETAZ_TRACE_UNKSIG")) {
+            fprintf(stderr,
+                    "[unksig] %s!%s assumed argc=%d stdcall=%d -> ret=0x%x\n",
+                    t.info.dll, t.info.name, t.info.argc,
+                    static_cast<int>(t.info.stdcall), ret_addr);
+        }
+    }
+
     if (!t.info.known) {
         // No signature-table entry: assume a plain stdcall function with
         // `t.info.argc` 32-bit args (GetProcAddress-resolved runtime bindings).
         // The CIF was built for argc args, so read that many from the stack.
+        //
+        // When argc was never verified (imputed as 0 at thunk creation), decode
+        // the guest's call site to recover the real count. A thunk created from
+        // an explicit GetProcAddress binding already carries a deliberate argc,
+        // so only an imputed 0 is overridden — and only upward, never below a
+        // count the caller supplied on purpose.
+        if (t.info.argc == 0 && !t.inferred) {
+            t.inferred = true;
+            // A caller that pops the arguments itself (`add esp, N`) means the
+            // import is cdecl: the thunk must not pop too, only pass the args.
+            const uint32_t cdecl_argc = infer_cdecl_cleanup_argc(ret_addr);
+            uint32_t effective = cdecl_argc;
+            bool cdecl = cdecl_argc > 0;
+            if (!cdecl) effective = infer_argc_from_call_site(ret_addr);
+            if (effective > t.info.argc && effective <= 24) {
+                for (int i = 0; i < static_cast<int>(effective); i++) {
+                    t.arg_types[i] = &ffi_type_uint64;
+                }
+                if (ffi_prep_cif(&t.cif, FFI_DEFAULT_ABI, static_cast<int>(effective),
+                                 &ffi_type_uint64, t.arg_types) == FFI_OK) {
+                    if (getenv("THETAZ_TRACE_UNKSIG")) {
+                        fprintf(stderr,
+                                "[unksig] %s!%s inferred argc=%u %s from call site 0x%x\n",
+                                t.info.dll, t.info.name, effective,
+                                cdecl ? "cdecl" : "stdcall", ret_addr);
+                    }
+                    t.info.argc = static_cast<int>(effective);
+                    if (cdecl) t.info.stdcall = false;
+                }
+            }
+        }
         uint32_t esp = s.regs[XR_ESP];
         ffi_arg values[24];
         void* avalues[24];

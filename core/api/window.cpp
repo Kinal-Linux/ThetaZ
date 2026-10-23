@@ -2676,6 +2676,36 @@ static int WINAPI_CALL THETAZ_MessageBoxA_Wrapper(WinHandle hwnd, const char* te
     return WINAPI64_MessageBoxA(hwnd, text, caption, type);
 }
 
+// Keyboard layouts. The guest has no real input server here: one layout is
+// exported (the process-wide en-US HKL), which is what a stock US-English
+// desktop reports. GetKeyboardLayoutList fills the caller's buffer or, when
+// lpList is NULL, just queries the count -- the standard contract.
+static const uint32_t kGuestKeyboardLayout = 0x04090409u; // MAKELANGID(EN,US)
+
+static int WINAPI_CALL THETAZ_GetKeyboardLayoutList_Wrapper(int n_buff,
+                                                            void* lp_list) {
+    if (lp_list && n_buff > 0) {
+        *reinterpret_cast<uint32_t*>(lp_list) = kGuestKeyboardLayout;
+    }
+    return 1;
+}
+
+static uint32_t WINAPI_CALL THETAZ_GetKeyboardLayout_Wrapper(void* id_thread) {
+    (void)id_thread;
+    return kGuestKeyboardLayout;
+}
+
+// RegisterWindowMessageA is implemented in kernel32_winword.cpp but registered
+// here alongside the rest of the user32 surface (the guest imports it as a
+// user32 export, as real Windows does). Declared locally to avoid pulling in
+// kernel32.h, whose declarations collide with this file's own definitions.
+extern UINT WINAPI_CALL THETAZ_RegisterWindowMessageA(LPCSTR lpString);
+
+static uint32_t THETAZ_RegisterWindowMessageA_Wrapper(const char* name) {
+    if (x86_dispatch_active()) return THETAZ_RegisterWindowMessageA(name);
+    return 1;
+}
+
 // --- Initialization ----------------------------------------------------------
 
 static std::once_flag g_window_init_once;
@@ -2724,6 +2754,12 @@ void initialize_window_layer() {
         register_api("user32.dll", "DialogBoxParamA", (void*)THETAZ_DialogBoxParamA_Wrapper);
         register_api("user32.dll", "EndDialog", (void*)THETAZ_EndDialog_Wrapper);
         register_api("user32.dll", "MessageBoxA", (void*)THETAZ_MessageBoxA_Wrapper);
+        register_api("user32.dll", "GetKeyboardLayoutList",
+                     (void*)THETAZ_GetKeyboardLayoutList_Wrapper);
+        register_api("user32.dll", "GetKeyboardLayout",
+                     (void*)THETAZ_GetKeyboardLayout_Wrapper);
+        register_api("user32.dll", "RegisterWindowMessageA",
+                     (void*)THETAZ_RegisterWindowMessageA_Wrapper);
         if (!g_timer_thread.joinable()) {
             g_timer_thread = std::thread(timer_thread_main);
             g_timer_thread.detach();

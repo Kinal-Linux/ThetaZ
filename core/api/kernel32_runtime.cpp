@@ -2513,7 +2513,12 @@ void initialize_kernel32_runtime(){
     register_api("kernel32.dll", "SystemTimeToFileTime", (void*)THETAZ_SystemTimeToFileTime);
     register_api("kernel32.dll", "FileTimeToSystemTime", (void*)THETAZ_FileTimeToSystemTime);
     register_api("kernel32.dll", "GetCPInfoExW", (void*)THETAZ_GetCPInfoExW);
-    register_api("kernel32.dll", "GetSystemDirectoryW", s);
+    // GetSystemDirectoryW must NOT be a generic stub: kernel32_batch.cpp
+    // registers the real wide implementation, and the registry keeps the LAST
+    // registration. Initialize order puts kernel32_batch first and this file
+    // second, so a stub here would shadow the real one and make the installer's
+    // GetSystemDirectoryW call fail (returning 0 and writing no buffer), which
+    // drives it into an error path that dereferences a bogus COM pointer.
     register_api("kernel32.dll", "GetTempPathW", s);
     register_api("kernel32.dll", "CreateDirectoryW", s);
     register_api("kernel32.dll", "GetFileAttributesExW", s);

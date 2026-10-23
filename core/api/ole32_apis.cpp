@@ -1179,9 +1179,51 @@ LSTATUS WINAPI_CALL THETAZ_RegOpenKeyW(HKEY hKey, const wchar_t* lpSubKey, PHKEY
 // shlwapi.dll
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// CSIDL values the shell folder APIs resolve. Office's bootstrap queries these
+// to locate its install tree; they map onto the emulated drive the way Wine's
+// own c:\windows layout would on a real desktop.
+struct ShellFolderMapping {
+    int csidl;
+    const wchar_t* path;
+};
+
+const ShellFolderMapping kShellFolders[] = {
+    {0x0000, L"C:\\"},
+    {0x0024, L"C:\\"},                              // CSIDL_WINDOWS
+    {0x0025, L"C:\\Windows\\System32"},             // CSIDL_SYSTEM
+    {0x0014, L"C:\\Windows\\System32"},             // CSIDL_SYSTEMX86
+    {0x0008, L"C:\\Windows\\System32"},             // CSIDL_PROGRAM_FILES
+    {0x001a, L"C:\\Program Files (x86)"},           // CSIDL_PROGRAM_FILESX86
+    {0x001c, L"C:\\Program Files\\Common Files"},   // CSIDL_PROGRAM_FILES_COMMON
+    {0x001e, L"C:\\Program Files (x86)\\Common Files"}, // CSIDL_PROGRAM_FILES_COMMONX86
+    {0x0005, L"C:\\Users\\Public\\Documents"},      // CSIDL_PERSONAL (my docs base)
+    {0x0026, L"C:\\ProgramData"},                   // CSIDL_PROFILE (all-users appdata)
+    {0x0013, L"C:\\Users\\Public\\AppData\\Roaming"}, // CSIDL_COMMON_APPDATA
+    {0x001b, L"C:\\Users\\Public\\AppData\\Local"},   // CSIDL_COMMON_DOCUMENTS
+};
+
+const wchar_t* shell_folder_path_for(int csidl) {
+    for (const ShellFolderMapping& m : kShellFolders) {
+        if (m.csidl == csidl) return m.path;
+    }
+    return nullptr;
+}
+
+} // namespace
+
 HRESULT WINAPI_CALL THETAZ_SHGetFolderPathW(void* hwnd, int csidl, void* hToken, DWORD dwFlags, LPWSTR pszPath) {
-    (void)hwnd; (void)csidl; (void)hToken; (void)dwFlags; (void)pszPath;
-    return E_NOTIMPL;
+    (void)hwnd; (void)hToken;
+    if (!pszPath || dwFlags != 0) return E_INVALIDARG;
+    const wchar_t* path = shell_folder_path_for(csidl);
+    if (!path) return E_FAIL;
+    // The contract is MAX_PATH wchars including the terminator.
+    wchar_t* dst = reinterpret_cast<wchar_t*>(pszPath);
+    size_t len = 0;
+    while (len < 259 && path[len]) { dst[len] = path[len]; ++len; }
+    dst[len] = 0;
+    return S_OK;
 }
 
 HRESULT WINAPI_CALL THETAZ_SHGetFolderPathA(void* hwnd, int csidl, void* hToken, DWORD dwFlags, LPSTR pszPath) {
@@ -1605,6 +1647,10 @@ void initialize_ole32_apis() {
     // shlwapi.dll
     register_api("shlwapi.dll", "SHGetFolderPathW", (void*)THETAZ_SHGetFolderPathW);
     register_api("shlwapi.dll", "SHGetFolderPathA", (void*)THETAZ_SHGetFolderPathA);
+    // shell32.dll owns this API as well; the installer imports resolve against
+    // shell32, so both names must point at the real implementation.
+    register_api("shell32.dll", "SHGetFolderPathW", (void*)THETAZ_SHGetFolderPathW);
+    register_api("shell32.dll", "SHGetFolderPathA", (void*)THETAZ_SHGetFolderPathA);
     register_api("shlwapi.dll", "SHGetKnownFolderPath", (void*)THETAZ_SHGetKnownFolderPath);
     register_api("shlwapi.dll", "SHGetMalloc", (void*)THETAZ_SHGetMalloc);
     register_api("shlwapi.dll", "SHGetDesktopFolder", (void*)THETAZ_SHGetDesktopFolder);
