@@ -263,6 +263,109 @@ static std::unordered_map<std::string, void*> g_builtin_handles;
 static std::unordered_map<void*, std::string> g_builtin_names;
 static std::atomic<uintptr_t> g_next_builtin_handle{0x78000000};
 
+// ---------------------------------------------------------------------------
+// Builtin DLL images
+//
+// A builtin API DLL we serve from the registry has no file to map, so a guest
+// that asks for its module handle used to get a bare synthetic handle
+// (0x78000000 + n * 0x1000). That address is not backed by any mapping, and
+// guest code that treats an HMODULE as a module base -- wherever it reads the
+// PE header -- dereferences unmapped memory. MSVC's C++ exception filter is
+// exactly that case: it calls GetModuleHandleW(L"kernel32.dll") and then reads
+// the PE headers to decide whether the throw came from a native PE32 image.
+//
+// The handle now comes from a real mapped image: a minimal, well-formed PE32
+// image placed in the guest address space, carrying just enough of the header
+// (DOS header, PE signature, COFF and optional header, section table) for
+// header and directory reads to succeed. The optional header's characteristics
+// say IMAGE_FILE_32BIT_MACHINE, which is what the filter needs.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr uint32_t kBuiltinImageSize = 0x10000u; // one page per module is ample
+
+// Write a little-endian u16/u32 helper for guest memory.
+void img16(uint8_t* p, uint32_t off, uint16_t v) {
+    p[off + 0] = static_cast<uint8_t>(v);
+    p[off + 1] = static_cast<uint8_t>(v >> 8);
+}
+void img32(uint8_t* p, uint32_t off, uint32_t v) {
+    p[off + 0] = static_cast<uint8_t>(v);
+    p[off + 1] = static_cast<uint8_t>(v >> 8);
+    p[off + 2] = static_cast<uint8_t>(v >> 16);
+    p[off + 3] = static_cast<uint8_t>(v >> 24);
+}
+
+} // namespace
+
+// Build a minimal PE32 image at `base` in guest memory. Only the headers are
+// populated; there are no sections because guest code that reads one of these
+// handles is looking for the PE signature / machine type, not section data.
+static void write_builtin_pe_image(uint8_t* base, const char* dll_name) {
+    memset(base, 0, kBuiltinImageSize);
+
+    // DOS header: MZ plus e_lfanew pointing at the PE signature.
+    img16(base, 0x00, 0x5A4Du);
+    img16(base, 0x02, 0x0090u);       // e_cblp: bytes on last page (file size % 512)
+    img16(base, 0x04, 0x0003u);       // e_cp: pages in file
+    img16(base, 0x08, 0x0004u);       // e_maxalloc
+    img16(base, 0x0C, 0xFFFFu);       // e_minalloc
+    img16(base, 0x18, 0x0040u);       // e_cs
+    img16(base, 0x1C, 0x00B4u);       // e_ip
+    img16(base, 0x24, 0x0000u);       // e_ss
+    img16(base, 0x3C, 0x40u);         // e_lfanew
+    img16(base, 0x3E, 0x00B8u);       // e_oemid
+    img16(base, 0x40, 0x0000u);       // e_oeminfo
+
+    // PE signature + COFF header at 0x40.
+    img32(base, 0x40, 0x00004550u);   // "PE\0\0"
+    img16(base, 0x44, 0x014Cu);       // Machine = IMAGE_FILE_MACHINE_I386
+    img16(base, 0x46, 0u);            // NumberOfSections: headers only
+    img32(base, 0x48, 0u);            // TimeDateStamp
+    img32(base, 0x4C, 0u);            // PointerToSymbolTable
+    img32(base, 0x50, 0u);            // NumberOfSymbols
+    img16(base, 0x54, 0xE0u);         // SizeOfOptionalHeader (PE32)
+    img16(base, 0x56, 0x0102u);       // Characteristics: EXECUTABLE_IMAGE | 32BIT_MACHINE
+
+    // Optional header (PE32, 0xE0 bytes) at 0x58.
+    img16(base, 0x58, 0x010Bu);       // Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC
+    img32(base, 0x5C, 0x2000u);       // SizeOfCode
+    img32(base, 0x60, 0x1000u);       // SizeOfInitializedData
+    img32(base, 0x64, 0u);            // SizeOfUninitializedData
+    img32(base, 0x68, 0x1000u);       // AddressOfEntryPoint
+    img32(base, 0x6C, 0x1000u);       // BaseOfCode
+    img32(base, 0x70, 0x10000u);      // BaseOfData
+    img32(base, 0x74, kBuiltinImageSize); // ImageBase
+    img32(base, 0x78, 0x1000u);       // SectionAlignment
+    img32(base, 0x7C, 0x0200u);       // FileAlignment
+    img16(base, 0x80, 6u);            // MajorOperatingSystemVersion
+    img16(base, 0x86, 6u);            // MajorSubsystemVersion
+    img32(base, 0x88, kBuiltinImageSize); // SizeOfImage
+    img32(base, 0x8C, 0x0200u);       // SizeOfHeaders
+    img32(base, 0x90, 0u);            // CheckSum
+    img16(base, 0x94, 3u);            // Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI
+    img16(base, 0x96, 0x0000u);       // DllCharacteristics
+    img32(base, 0xA0, 0x100000u);     // SizeOfStackReserve
+    img32(base, 0xA4, 0x1000u);       // SizeOfStackCommit
+    img32(base, 0xA8, 0x100000u);     // SizeOfHeapReserve
+    img32(base, 0xAC, 0x1000u);       // SizeOfHeapCommit
+    img32(base, 0xB0, 0u);            // LoaderFlags
+    img32(base, 0xB4, 16u);           // NumberOfRvaAndSizes
+    img32(base, 0xB8, 0u);            // LoaderFlags (dup, kept aligned)
+    // 16 data directories (8 bytes each) start at 0x98; all zero (export,
+    // import, resource, debug, CLR, ...). Zero directories are a valid image.
+    // Export directory is left empty on purpose: these DLLs' functions are
+    // served by the API registry, not by an export table in guest memory.
+
+    // A recognisable name in the debug directory's place is not needed, but
+    // store the DLL name in the last 64 bytes so a dump is self-describing.
+    if (dll_name) {
+        size_t n = strlen(dll_name);
+        if (n > 64) n = 64;
+        memcpy(base + kBuiltinImageSize - 64, dll_name, n);
+    }
+}
+
 void* get_builtin_module_handle(const char* name) {
     if (!name || !name[0]) return nullptr;
     std::string n = name;
@@ -272,11 +375,42 @@ void* get_builtin_module_handle(const char* name) {
         auto it = g_builtin_handles.find(n);
         if (it != g_builtin_handles.end()) return it->second;
     }
-    void* h = reinterpret_cast<void*>(g_next_builtin_handle.fetch_add(0x1000));
-    std::lock_guard<std::mutex> lock(g_builtin_mutex);
-    g_builtin_handles[n] = h;
-    g_builtin_names[h] = n;
-    return h;
+
+    // Place a real mapped image for this module. The address is taken from the
+    // same synthetic range as before so existing comparisons against
+    // get_builtin_module_handle() output keep working, but the range is now
+    // backed by guest-visible memory with a minimal PE image in it.
+    const uintptr_t kPage = 0x1000u;
+    uintptr_t map_addr = g_next_builtin_handle.fetch_add(kBuiltinImageSize);
+    map_addr &= ~(kPage - 1u); // the stride is already a whole number of pages
+
+    uint8_t* mapped = nullptr;
+    for (int attempt = 0; attempt < 8 && !mapped; ++attempt) {
+        void* p = mmap(reinterpret_cast<void*>(map_addr), kBuiltinImageSize,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != MAP_FAILED) {
+            mapped = static_cast<uint8_t*>(p);
+        } else {
+            map_addr += kBuiltinImageSize; // region taken; try the next slot
+        }
+    }
+    if (!mapped) {
+        // No address available: fall back to the bare handle (the previous
+        // behaviour) rather than failing the caller's module lookup.
+        std::lock_guard<std::mutex> lock(g_builtin_mutex);
+        g_builtin_handles[n] = reinterpret_cast<void*>(map_addr);
+        g_builtin_names[reinterpret_cast<void*>(map_addr)] = n;
+        return reinterpret_cast<void*>(map_addr);
+    }
+    write_builtin_pe_image(mapped, n.c_str());
+
+    {
+        std::lock_guard<std::mutex> lock(g_builtin_mutex);
+        g_builtin_handles[n] = mapped;
+        g_builtin_names[mapped] = n;
+    }
+    return mapped;
 }
 
 const char* builtin_handle_name(void* handle) {

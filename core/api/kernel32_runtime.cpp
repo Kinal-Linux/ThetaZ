@@ -1633,6 +1633,37 @@ static SehFrameLayout seh_frame_layout(uint32_t frame, uint32_t walk_ebp) {
         if (saved4 < saved3) return {frame + 0x10, saved4, true};
         return {frame + 0x0c, saved3, true};
     }
+    // Neither slot holds a plausible saved EBP. That is the shape of an MSVC
+    // __except_handler4 node, whose words are
+    //   +0x00 prev, +0x04 handler, +0x08 scopetable ^ __security_cookie,
+    //   +0x0C trylevel, +0x10 first context word
+    // so +0x0C holds a trylevel (commonly 0) and +0x10 is not a frame pointer
+    // at all. Detecting it matters: MSVC's _CxxFrameHandler takes its CONTEXT*
+    // from its own argument slot, but the emulator still needs a usable EBP to
+    // build the handler's frame-relative state, and falling back to the outer
+    // frame's EBP here silently shifted every scope lookup by one frame.
+    //
+    // The cookie-encoded scopetable at +0x08 is the reliable discriminator:
+    // decoding it against the image's __security_cookie yields a pointer into
+    // .rdata, whereas a classic 4-word node's +0x08 is a trylevel.
+    if (read32(frame + 0x08) != 0) {
+        uint32_t decoded = read32(frame + 0x08);
+        for (uint32_t base : {0x400000u, 0x21600000u, 0x20000000u}) {
+            if (base >= 0x80000000u) continue;
+            uint32_t cookie = 0;
+            if (maps_range_readable(static_cast<uintptr_t>(base + 0x66E780u), 4)) {
+                cookie = read32(base + 0x66E780u);
+            }
+            uint32_t table = decoded ^ cookie;
+            if (cookie && maps_range_readable(static_cast<uintptr_t>(table), 8) &&
+                table >= base && table < base + 0x800000u) {
+                // Confirmed handler4: the establisher's frame pointer is the
+                // nearest word BELOW this node on the stack, so use the walk
+                // EBP the caller supplied rather than inventing one.
+                return {0, walk_ebp, false};
+            }
+        }
+    }
     return none;
 }
 
