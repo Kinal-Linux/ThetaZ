@@ -253,6 +253,7 @@ const SigEntry kSignatures[] = {
     ST("kernel32.dll", "GetSystemTime", 1),
     ST("kernel32.dll", "GetSystemTimeAsFileTime", 1),
     ST("kernel32.dll", "GetSystemTimePreciseAsFileTime", 1),
+    ST("kernel32.dll", "GetSystemTimePreciseAsFileTime", 1),
     ST("kernel32.dll", "GetTempFileNameW", 4),
     ST("kernel32.dll", "GetTempPathA", 2),
     ST("kernel32.dll", "GetTempPathW", 2),

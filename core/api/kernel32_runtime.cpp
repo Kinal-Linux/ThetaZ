@@ -1057,8 +1057,63 @@ BOOL WINAPI_CALL THETAZ_UpdateWindow_Wrapper(WinHandle hwnd) {
 // Missing kernel32 implementations (added for executable linking)
 // =========================================================================
 
+// Canonical DLL name for the signature table: api-ms-win-* api-sets and the
+// runtime CRT aliases map onto the implementation module their exports live
+// in. Kept in sync with sig_dll_name() in core/x86/api_dispatch.cpp.
+static const char* canonical_sig_dll(const char* dll) {
+    static thread_local std::string out;
+    if (!dll) return dll;
+    std::string n = dll;
+    for (auto& c : n) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (n.compare(0, 15, "api-ms-win-crt") == 0) { out = "ucrtbase.dll"; return out.c_str(); }
+    if (n.compare(0, 15, "api-ms-win-core") == 0 || n.compare(0, 15, "ext-ms-win-core") == 0) {
+        out = "kernel32.dll";
+        return out.c_str();
+    }
+    if (n == "vcruntime140.dll" || n == "vcruntime140_1.dll" || n == "vcruntime140d.dll" ||
+        n.compare(0, 6, "msvcrt") == 0) { out = "ucrtbase.dll"; return out.c_str(); }
+    out = dll;
+    return out.c_str();
+}
+
 FARPROC WINAPI_CALL THETAZ_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
     if (!hModule || !lpProcName) return nullptr;
+    // A synthetic builtin module handle (api-ms-win-* api-sets and DLLs we
+    // serve internally) must resolve exports under the name the guest asked
+    // for, not only under the handful of hardcoded DLL names below. OfficeSetup
+    // binds Fiber-Local-Storage through api-ms-win-core-fibers-l1-1-1, which
+    // was not in that list, so FlsGetValue/FlsAlloc returned a stub and the
+    // installer's retry loop spun on a function that returns no value.
+    const char* synth_dll = builtin_handle_name((void*)(uintptr_t)hModule);
+    if (synth_dll) {
+        std::string synth_name = synth_dll;
+        // The registry keys carry a .dll suffix; api-set handles do not.
+        if (synth_name.size() < 4 ||
+            synth_name.compare(synth_name.size() - 4, 4, ".dll") != 0) {
+            synth_name += ".dll";
+        }
+        if ((uintptr_t)lpProcName < 0x10000) {
+            uint16_t ord = (uint16_t)(uintptr_t)lpProcName;
+            void* fn = ApiRegistry::instance().find_function_ordinal(synth_name, ord);
+            if (fn) return (FARPROC)fn;
+        } else {
+            void* fn = ApiRegistry::instance().find_function(synth_name, lpProcName);
+            if (fn) {
+                if (guest_is_32bit()) {
+                    // Allocate the thunk under the canonical DLL name the
+                    // signature table is keyed by (kernel32.dll, ucrtbase.dll,
+                    // ... for the api-ms-win-* sets). Passing the api-set name
+                    // here would leave the thunk with no signature row, i.e.
+                    // an argc of 0 that reads no arguments and pops none.
+                    uint32_t thunk = alloc_api_thunk(fn, 0, true,
+                                                     canonical_sig_dll(synth_name.c_str()),
+                                                     lpProcName);
+                    if (thunk) return (FARPROC)(uintptr_t)thunk;
+                }
+                return (FARPROC)fn;
+            }
+        }
+    }
     PELoader& loader = PELoader::instance();
     LoadedModule* guest_mod = loader.find_module_by_base((uint64_t)(uintptr_t)hModule);
     if (guest_mod) {
@@ -2505,6 +2560,7 @@ void initialize_kernel32_runtime(){
     register_api("kernel32.dll", "LCMapStringW", s);
     register_api("kernel32.dll", "FormatMessageA", s);
     register_api("kernel32.dll", "GetSystemTimeAsFileTime", (void*)THETAZ_GetSystemTimeAsFileTime);
+    register_api("kernel32.dll", "GetSystemTimePreciseAsFileTime", (void*)THETAZ_GetSystemTimePreciseAsFileTime);
     register_api("kernel32.dll", "GetTickCount64", (void*)THETAZ_GetTickCount64);
     register_api("kernel32.dll", "K32GetProcessMemoryInfo", (void*)THETAZ_K32GetProcessMemoryInfo);
     register_api("kernel32.dll", "GlobalMemoryStatusEx", s);
@@ -4954,6 +5010,17 @@ void WINAPI_CALL THETAZ_GetSystemTimeAsFileTime(void* out) {
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t ft = (uint64_t)ts.tv_sec * 10000000ULL + (uint64_t)ts.tv_nsec / 100 + kEpoch1601Offset;
     *(uint64_t*)out = ft;
+}
+INT WINAPI_CALL THETAZ_GetSystemTimePreciseAsFileTime(void* out) {
+    if (!out) return 0;
+    // Same source and contract as GetSystemTimeAsFileTime (a FILETIME at 100ns
+    // resolution). The emulator exposes no finer-grained system-time clock, and
+    // the Office installer delay-imports this only for coarse progress timing.
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ft = (uint64_t)ts.tv_sec * 10000000ULL + (uint64_t)ts.tv_nsec / 100 + kEpoch1601Offset;
+    *(uint64_t*)out = ft;
+    return 0;
 }
 void WINAPI_CALL THETAZ_GetSystemTime(void* out) {
     if (!out) return;
