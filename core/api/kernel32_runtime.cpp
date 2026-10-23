@@ -1106,11 +1106,14 @@ FARPROC WINAPI_CALL THETAZ_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
             return (FARPROC)fn;
         }
     }
-    if (guest_is_32bit()) {
-        uint32_t thunk = alloc_api_thunk((void*)generic_api_stub, 0, true, "kernel32.dll", name.c_str());
-        if (thunk) return (FARPROC)(uintptr_t)thunk;
-    }
-    return (FARPROC)(uintptr_t)generic_api_stub;
+    // An export we do not implement. Windows reports failure here: the
+    // function pointer is NULL and the last error is ERROR_PROC_NOT_FOUND.
+    // Returning a stub instead (the previous behaviour) gives the caller a
+    // pointer it may call — a host function that returns 0 having read no
+    // arguments — which is what corrupted Wine DLLs that resolve their own
+    // debug exports (__wine_dbg_*) through GetProcAddress and then call them.
+    THETAZ_SetLastError(127 /* ERROR_PROC_NOT_FOUND */);
+    return nullptr;
 }
 
 LPVOID WINAPI_CALL THETAZ_HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes) {

@@ -2466,7 +2466,12 @@ int x86_run(X86CpuState& s, const X86RunOptions& opts) {
             }
 
             case 0xCC: { // INT3
-                interp_fault(s, "int3");
+                // MSVC emits `int3` as inter-function padding (and after tail
+                // calls in some linked images). Real Windows would raise
+                // EXCEPTION_BREAKPOINT here, but the padding form is never
+                // reached by a live debugger, so the byte is treated as a
+                // one-byte no-op: execution continues at the next instruction
+                // instead of tearing the guest down.
                 break;
             }
             case 0xCD: { // INT imm8
