@@ -20,6 +20,39 @@ namespace ThetaZ {
 uint64_t get_main_module_base();
 
 // ---------------------------------------------------------------------------
+// Wild-jump detection
+//
+// True when an address could plausibly hold guest code: inside the mapped
+// image range the loader uses, the guest heap, or a thread stack. Anything
+// else is a corrupted function pointer. Only feeds the env-gated
+// THETAZ_TRACE_WILD report, which prints the full register set so a wild
+// transfer can be traced back to the API that produced the pointer.
+// ---------------------------------------------------------------------------
+static inline bool guest_addr_may_hold_code(uint32_t a) {
+    if (a < 0x01000000u) return true;                  // image bases / low maps
+    if (a >= 0x40000000u && a < 0x78000000u) return true; // guest heap + thunks
+    return false;
+}
+
+// Callback return sentinels pushed by x86_call_guest_args(); a RET to one of
+// these is the normal end of a guest callback, not a wild transfer.
+static inline bool is_callback_sentinel(uint32_t a) {
+    return a >= 0xCA11B000u && a < 0xCA11B100u;
+}
+
+static inline void report_wild_transfer(const char* kind, uint32_t target,
+                                        const X86CpuState& s, const char* src,
+                                        uint32_t rm, uint32_t mem) {
+    if (!getenv("THETAZ_TRACE_WILD")) return;
+    fprintf(stderr,
+            "[wild%s] target=0x%08x from=0x%08x %s reg=%u mem=0x%08x esi=0x%08x "
+            "edi=0x%08x ebp=0x%08x esp=0x%08x eax=0x%08x ecx=0x%08x edx=0x%08x ebx=0x%08x\n",
+            kind, target, s.eip, src, rm, mem, s.regs[XR_ESI], s.regs[XR_EDI],
+            s.regs[XR_EBP], s.regs[XR_ESP], s.regs[XR_EAX], s.regs[XR_ECX],
+            s.regs[XR_EDX], s.regs[XR_EBX]);
+}
+
+// ---------------------------------------------------------------------------
 // Guest memory (identity-mapped below 4GB)
 // ---------------------------------------------------------------------------
 
@@ -658,10 +691,11 @@ static thread_local uint32_t g_guest_fault_esp = 0;
 static thread_local bool g_guest_fault_write = false;
 
 static void trace_push(uint32_t eip) {
-    if (getenv("THETAZ_TRACE_INSNS")) {
-        g_trace_buf[g_trace_pos & 127] = eip;
-        g_trace_pos++;
-    }
+    // Always record: a single array store, and it makes the fault dump's EIP
+    // ring available without the very verbose THETAZ_TRACE_INSNS per-instruction
+    // log (which is what pinpointing a wild jump depends on).
+    g_trace_buf[g_trace_pos & 127] = eip;
+    g_trace_pos++;
 }
 
 static void trace_dump() {
@@ -738,6 +772,55 @@ static void interp_fault(X86CpuState& s, const char* what) {
             what, s.eip);
     trace_dump();
     s.halted = true;
+}
+
+// Deliver EXCEPTION_BREAKPOINT (0x80000003) to the guest's SEH chain, mirroring
+// the hardware-fault dispatch: mark the interpreter inactive so a fault inside
+// a guest handler is not mistaken for another int3, raise, then either resume
+// where the handler chose or report the exception as unhandled.
+static void interp_fault_int3(X86CpuState& s) {
+    constexpr uint32_t kBreakpoint = 0x80000003u;
+    const bool trace = getenv("THETAZ_TRACE_FAULTS") != nullptr ||
+                       getenv("THETAZ_TRACE_SEH") != nullptr;
+    const bool prev_active = g_interp_active;
+    X86CpuState* prev_state = g_fault_state;
+    uint32_t prev_sentinel = g_callback_sentinel;
+    sigjmp_buf* prev_jmp = g_fault_jmp_ptr;
+
+    if (trace) {
+        fprintf(stderr, "[Thetax86] int3 at eip=0x%08x esp=0x%08x; raising 0x%08x\n",
+                s.eip, s.regs[XR_ESP], kBreakpoint);
+    }
+    trace_dump();
+
+    g_interp_active = false;
+    g_in_guest_exception_dispatch = true;
+    const bool handled = x86_raise_guest_exception(kBreakpoint, s.eip,
+                                                   s.regs[XR_ESP], 0, nullptr);
+    g_in_guest_exception_dispatch = false;
+
+    if (!handled) {
+        fprintf(stderr,
+                "[Thetax86] unhandled breakpoint (0x%08x) at eip=0x%08x; "
+                "terminating guest\n", kBreakpoint, s.eip);
+        s.halted = true;
+        s.exit_code = static_cast<int>(kBreakpoint);
+        g_interp_active = prev_active;
+        g_fault_state = prev_state;
+        g_callback_sentinel = prev_sentinel;
+        g_fault_jmp_ptr = prev_jmp;
+        return;
+    }
+
+    // A guest handler claimed it: resume at the continuation it chose.
+    X86SehResume& seh = x86_seh_resume_state();
+    s.eip = seh.eip;
+    s.regs[XR_ESP] = seh.esp;
+    s.regs[XR_EBP] = seh.ebp;
+    s.regs[XR_EDX] = seh.edx;
+    seh.active = false;
+    g_interp_active = true;
+    g_fault_state = &s;
 }
 
 // ---------------------------------------------------------------------------
@@ -2408,15 +2491,29 @@ int x86_run(X86CpuState& s, const X86RunOptions& opts) {
             }
 
             case 0xC2: { // RET imm16
+                {
                 uint16_t n = fetch16(s);
-                s.eip = pop32(s);
+                uint32_t target = pop32(s);
+                if (!guest_addr_may_hold_code(target) && !is_api_thunk_addr(target) &&
+                    !is_callback_sentinel(target)) {
+                    report_wild_transfer("ret", target, s, "ret-imm", 0, 0);
+                }
+                s.eip = target;
                 s.regs[XR_ESP] += n;
                 if (g_callback_sentinel && s.eip == g_callback_sentinel) s.halted = true;
+                }
                 break;
             }
             case 0xC3: { // RET
-                s.eip = pop32(s);
+                {
+                uint32_t target = pop32(s);
+                if (!guest_addr_may_hold_code(target) && !is_api_thunk_addr(target) &&
+                    !is_callback_sentinel(target)) {
+                    report_wild_transfer("ret", target, s, "ret", 0, 0);
+                }
+                s.eip = target;
                 if (g_callback_sentinel && s.eip == g_callback_sentinel) s.halted = true;
+                }
                 break;
             }
 
@@ -2466,12 +2563,15 @@ int x86_run(X86CpuState& s, const X86RunOptions& opts) {
             }
 
             case 0xCC: { // INT3
-                // MSVC emits `int3` as inter-function padding (and after tail
-                // calls in some linked images). Real Windows would raise
-                // EXCEPTION_BREAKPOINT here, but the padding form is never
-                // reached by a live debugger, so the byte is treated as a
-                // one-byte no-op: execution continues at the next instruction
-                // instead of tearing the guest down.
+                // Raise a real EXCEPTION_BREAKPOINT through the guest's SEH
+                // chain. MSVC uses int3 both as a debugger breakpoint and as
+                // padding after noreturn paths (e.g. a C++ throw helper that
+                // unwound without transferring control). Treating the byte as a
+                // no-op was wrong: execution then falls into the following
+                // function's byte stream and runs misaligned. If the app has a
+                // handler it resumes there; if not the exception is unhandled
+                // and reported, which is the honest outcome.
+                interp_fault_int3(s);
                 break;
             }
             case 0xCD: { // INT imm8
@@ -3028,6 +3128,16 @@ int x86_run(X86CpuState& s, const X86RunOptions& opts) {
                             fprintf(stderr, "[indcall] call target=0x%08x from=0x%08x src=%s reg=%u mem=0x%08x esi=0x%08x edi=0x%08x esp=0x%08x\n",
                                     v, s.eip, is_reg ? "reg" : "mem", rm, base + ea,
                                     s.regs[XR_ESI], s.regs[XR_EDI], s.regs[XR_ESP]);
+                        }
+                        // A control transfer to an address that is neither an
+                        // API thunk nor inside any mapped guest region (images
+                        // below 0x26000000, the guest heap, or a thread stack)
+                        // is a wild jump. Report it with the full register set
+                        // so the pointer can be traced to the API that made it.
+                        if (!is_api_thunk_addr(v) && !guest_addr_may_hold_code(v) &&
+                            !is_callback_sentinel(v)) {
+                            report_wild_transfer("call", v, s,
+                                                 is_reg ? "reg" : "mem", rm, base + ea);
                         }
                         if (is_api_thunk_addr(v)) { s.eip = x86_dispatch_api(s, v, s.eip); }
                         else { push32(s, s.eip); s.eip = v; }
