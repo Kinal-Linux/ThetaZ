@@ -1101,6 +1101,7 @@ void* WINAPI_CALL THETAZ_LsaEnumerateLogonSessions(void* logonSessionCount, void
     void* WINAPI_CALL THETAZ_GetStockObject(int fnObject);
     int WINAPI_CALL THETAZ_GetSystemMetrics(int index);
     INT WINAPI_CALL THETAZ_GetSystemTimePreciseAsFileTime(void* lpFileTime);
+    DWORD WINAPI_CALL THETAZ_PowerDeterminePlatformRole();
     INT WINAPI_CALL THETAZ_GetTimeFormatEx(LPCWSTR lpLocaleName, DWORD dwFlags, const SYSTEMTIME* lpTime, LPCWSTR lpFormat, LPWSTR lpTimeStr, INT cchTime, void* lpCalendar);
     void* WINAPI_CALL THETAZ_GetWindowDC(void* hwnd);
     BOOL WINAPI_CALL THETAZ_InitializeCriticalSectionAndSpinCount(PCRITICAL_SECTION lpCriticalSection, DWORD dwSpinCount);

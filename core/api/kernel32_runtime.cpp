@@ -1341,9 +1341,17 @@ HMODULE WINAPI_CALL THETAZ_LoadLibraryExW(LPCWSTR p, HANDLE hFile, DWORD flags) 
         // LOAD_LIBRARY_AS_DATAFILE: no execution, just map. Return a synthetic handle.
         return (HMODULE)get_builtin_module_handle(path.c_str());
     }
-    if (name_is_builtin(path)) {
-        LoadedModule* m = ThetaZ::PELoader::instance().find_module_named(path.c_str());
-        if (!m) return (HMODULE)get_builtin_module_handle(path.c_str());
+    // A builtin module must be recognised by its BASENAME, not by the whole
+    // string. The delay-load helper builds a fully-qualified path
+    // ("C:\Windows\SysWOW64\POWRPROF.DLL") and passes LOAD_LIBRARY_SEARCH_SYSTEM32;
+    // testing the full path against the builtin list never matched, so the call
+    // fell through to load_guest_module on a literal "C:\..." host path and
+    // failed with ERROR_MOD_NOT_FOUND. That made Office's delay-load fail, and
+    // it responds by throwing std::exception("File").
+    std::string base = module_basename_lower(path);
+    if (name_is_builtin(base)) {
+        LoadedModule* m = ThetaZ::PELoader::instance().find_module_named(base.c_str());
+        if (!m) return (HMODULE)get_builtin_module_handle(base.c_str());
         return (HMODULE)(uintptr_t)m->base;
     }
     return (HMODULE)load_guest_module(path.c_str());
@@ -2670,6 +2678,16 @@ void initialize_kernel32_runtime(){
     register_api("kernel32.dll", "FormatMessageA", s);
     register_api("kernel32.dll", "GetSystemTimeAsFileTime", (void*)THETAZ_GetSystemTimeAsFileTime);
     register_api("kernel32.dll", "GetSystemTimePreciseAsFileTime", (void*)THETAZ_GetSystemTimePreciseAsFileTime);
+    // OfficeSetup.exe delay-imports exactly one function from powrprof.dll:
+    // PowerDeterminePlatformRole. The DLL has no file in this environment, so
+    // the delay-load failed, LoadLibraryExW honestly returned 0, and Office
+    // threw std::exception("File") -- which then walked the whole SEH chain
+    // unhandled and tore down the child process. Registering the function is
+    // what keeps the delay-load from failing at all.
+    register_api("powrprof.dll", "PowerDeterminePlatformRole",
+                 (void*)THETAZ_PowerDeterminePlatformRole);
+    register_api("kernel32.dll", "PowerDeterminePlatformRole",
+                 (void*)THETAZ_PowerDeterminePlatformRole);
     register_api("kernel32.dll", "GetTickCount64", (void*)THETAZ_GetTickCount64);
     register_api("kernel32.dll", "K32GetProcessMemoryInfo", (void*)THETAZ_K32GetProcessMemoryInfo);
     register_api("kernel32.dll", "GlobalMemoryStatusEx", s);
@@ -5137,6 +5155,12 @@ INT WINAPI_CALL THETAZ_GetSystemTimePreciseAsFileTime(void* out) {
     uint64_t ft = (uint64_t)ts.tv_sec * 10000000ULL + (uint64_t)ts.tv_nsec / 100 + kEpoch1601Offset;
     *(uint64_t*)out = ft;
     return 0;
+}
+
+// POWER_PLATFORM_ROLE. Callers use this to distinguish desktop from mobile
+// installs; the installer only branches on "is this a desktop".
+DWORD WINAPI_CALL THETAZ_PowerDeterminePlatformRole() {
+    return 1; // PlatformRoleDesktop
 }
 void WINAPI_CALL THETAZ_GetSystemTime(void* out) {
     if (!out) return;
