@@ -104,9 +104,17 @@ void* thread_entry(void* arg) {
                                       stack_base, stack_size,
                                       static_cast<uint32_t>(a->tid));
         if (a->pid != 0) {
-            // Free the child's image mapping to reclaim low-zone address space.
+            // Free the child's image mapping to reclaim low-zone address space
+            // -- but only once this is the LAST thread of the process. The
+            // child's other guest threads still execute code out of this image
+            // and hold SEH frames naming handlers in it; unmapping it here
+            // makes every later instruction fetch in those threads, and every
+            // SEH handler the dispatcher runs for them, jump into unmapped
+            // memory. (The emulator's own exception dispatch then faults at the
+            // handler address and the child dies with 0xC0000005.)
             uint64_t child_base = get_guest_process_image_base(a->pid);
-            if (child_base) {
+            if (child_base &&
+                ThetaServer::instance().live_thread_count(a->pid) <= 1) {
                 PELoader::instance().unload_image(child_base);
                 set_guest_process_image_base(a->pid, 0);
             }
@@ -147,6 +155,13 @@ ThreadRecord* ThreadManager::get_record(uint64_t thread_id) {
 }
 
 uint64_t ThreadManager::create_thread(uint64_t start_addr, uint64_t param, uint64_t stack_size, uint64_t pid) {
+    // A thread spawned from inside a child process belongs to that process:
+    // inherit the caller's guest pid when the caller did not name one. Without
+    // this, a child's secondary threads register under pid 0, the child's
+    // live-thread count is permanently 1, and the child's image gets unmapped
+    // while those threads are still executing guest code from it.
+    if (pid == 0) pid = get_current_guest_pid();
+
     std::lock_guard<std::mutex> lock(mutex_);
 
     uint64_t tid = ++next_thread_id_;

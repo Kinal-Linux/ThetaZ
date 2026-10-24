@@ -83,6 +83,12 @@ bool ThetaServer::terminate_process(uint64_t pid, uint32_t exit_code) {
         auto it = processes_.find(pid);
         if (it == processes_.end()) return false;
 
+        // A process terminates once. Its other threads may still be unwinding
+        // through their exit path after the primary thread ended the process;
+        // letting them re-terminate would overwrite the exit code the parent
+        // observes.
+        if (it->second->terminated) return false;
+
         it->second->terminated = true;
         it->second->exit_code = exit_code;
         proc = it->second;
@@ -149,6 +155,17 @@ bool ThetaServer::terminate_thread(uint64_t tid, uint32_t exit_code) {
         proc->obj_cond.notify_all();
     }
     return true;
+}
+
+size_t ThetaServer::live_thread_count(uint64_t pid) {
+    if (pid == 0) return 0; // pid 0 is not a child process
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t n = 0;
+    for (const auto& entry : threads_) {
+        const std::shared_ptr<ThreadObject>& t = entry.second;
+        if (t && t->pid == pid && !t->terminated) ++n;
+    }
+    return n;
 }
 
 uint64_t ThetaServer::create_event(const std::string& name, bool manual_reset, bool initial_state, uint64_t owner_pid) {

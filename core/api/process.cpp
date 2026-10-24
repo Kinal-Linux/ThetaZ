@@ -238,9 +238,11 @@ void terminate_current_process(uint32_t exit_code) {
     // Free the child's image mapping so the low zone can be reused by future
     // CreateProcess calls. Without this, each self-relaunch child leaves its
     // ~8MB image mapped and the 0x20000000-0x60000000 zone fills up after ~125
-    // children.
+    // children. Only once no other thread of the process is still running guest
+    // code from it: unmapping earlier leaves those threads (and the SEH
+    // handlers dispatched for them) executing unmapped memory.
     uint64_t child_base = get_guest_process_image_base(pid);
-    if (child_base) {
+    if (child_base && ThetaServer::instance().live_thread_count(pid) <= 1) {
         PELoader::instance().unload_image(child_base);
         set_guest_process_image_base(pid, 0);
     }

@@ -138,6 +138,12 @@ public:
     bool terminate_process(uint64_t pid, uint32_t exit_code);
     bool terminate_thread(uint64_t tid, uint32_t exit_code);
 
+    // Number of threads of `pid` that have not terminated yet. Used to decide
+    // whether a child's image can be unmapped: while other threads still run
+    // guest code from it, unmapping would leave them (and the SEH handlers
+    // dispatched for them) executing unmapped memory.
+    size_t live_thread_count(uint64_t pid);
+
     uint64_t create_event(const std::string& name, bool manual_reset, bool initial_state, uint64_t owner_pid);
     uint64_t create_semaphore(const std::string& name, int initial_count, int max_count, uint64_t owner_pid);
     uint64_t create_mutex(const std::string& name, uint64_t owner_pid);
