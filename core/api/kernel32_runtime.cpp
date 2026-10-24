@@ -2628,6 +2628,17 @@ void initialize_kernel32_runtime(){
     register_api("kernel32.dll", "GlobalFree", s);
     register_api("kernel32.dll", "MultiByteToWideChar", (void*)THETAZ_MultiByteToWideChar);
     register_api("kernel32.dll", "InitializeCriticalSectionEx", (void*)THETAZ_InitializeCriticalSectionEx);
+    // Both spellings matter here: Office's bootstrap calls
+    // InitializeCriticalSectionAndSpinCount, and a signature alone is not
+    // enough -- the previous behaviour was an unregistered name falling through
+    // to the generic stub, which returns FALSE. Office treats that as fatal and
+    // throws boost::system::system_error(GetLastError()).
+    register_api("kernel32.dll", "InitializeCriticalSectionAndSpinCount",
+                 (void*)THETAZ_InitializeCriticalSectionAndSpinCount);
+    register_api("kernelbase.dll", "InitializeCriticalSectionAndSpinCount",
+                 (void*)THETAZ_InitializeCriticalSectionAndSpinCount);
+    register_api("ntdll.dll", "RtlInitializeCriticalSectionAndSpinCount",
+                 (void*)THETAZ_InitializeCriticalSectionAndSpinCount);
     register_api("kernel32.dll", "DecodePointer", (void*)THETAZ_DecodePointer);
     register_api("kernel32.dll", "EncodePointer", (void*)THETAZ_EncodePointer);
     register_api("kernel32.dll", "CreateMutexW", (void*)THETAZ_CreateMutexW);
@@ -3156,8 +3167,8 @@ DWORD WINAPI_CALL THETAZ_GetExitCodeThread(HANDLE h, LPDWORD c){
     return TRUE;
 }
 HANDLE WINAPI_CALL THETAZ_OpenProcess(DWORD a, BOOL b, DWORD c){ (void)a;(void)b;(void)c; return (HANDLE)0x6; }
-BOOL WINAPI_CALL THETAZ_InitializeCriticalSectionEx(void* a, DWORD b, DWORD c){ (void)b;(void)c; THETAZ_InitializeCriticalSection((PCRITICAL_SECTION)a); return TRUE; }
-BOOL WINAPI_CALL THETAZ_InitializeCriticalSectionEx(struct _CRITICAL_SECTION* a, DWORD b, DWORD c){ (void)b;(void)c; THETAZ_InitializeCriticalSection((PCRITICAL_SECTION)a); return TRUE; }
+BOOL WINAPI_CALL THETAZ_InitializeCriticalSectionEx(PCRITICAL_SECTION a, DWORD b, DWORD c){ (void)b;(void)c; THETAZ_InitializeCriticalSection(a); return TRUE; }
+BOOL WINAPI_CALL THETAZ_InitializeCriticalSectionAndSpinCount(PCRITICAL_SECTION a, DWORD b){ (void)b; THETAZ_InitializeCriticalSection(a); return TRUE; }
 void WINAPI_CALL THETAZ_InitConditionVariable(void* a){ (void)a; }
 void WINAPI_CALL THETAZ_DeleteConditionVariable(void* a){ (void)a; }
 void release_fls_process(uint64_t p){ (void)p; }
