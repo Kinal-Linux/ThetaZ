@@ -1,7 +1,7 @@
-# ThetaZ — Windows Compatibility Layer
+# ThetaZ, Windows Compatibility Layer
 
 A **from-scratch, original C++ implementation** of a Windows compatibility layer
-for Linux x86-64. Licensed under GPL-3.0 — this is not derived from Wine, Proton,
+for Linux x86-64. Licensed under GPL-3.0, this is not derived from Wine, Proton,
 or any other existing compatibility project.
 
 The entire codebase is original C++17. The `Wine/` and `ProtonGE/` directories
