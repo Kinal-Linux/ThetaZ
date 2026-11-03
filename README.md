@@ -5,7 +5,7 @@ for Linux x86-64. Licensed under GPL-3.0, this is not derived from Wine, Proton,
 or any other existing compatibility project.
 
 The entire codebase is original C++17. The `Wine/` and `ProtonGE/` directories
-in this tree are **study references** — they are not compiled, linked, or
+in this tree are **study references**, they are not compiled, linked, or
 included in ThetaZ in any way.
 
 ## Why a new implementation
@@ -16,15 +16,15 @@ approaches the problem with modern C++: RAII, STL, type-safe namespaces, and a
 single build system (CMake).
 
 Key advantages:
-- **No PE/ELF split** — pure C++ with one compiler, one build system.
-- **`ms_abi` functions** — the Win32 layer uses GCC's `__attribute__((ms_abi))`
+- **No PE/ELF split**, pure C++ with one compiler, one build system.
+- **`ms_abi` functions**, the Win32 layer uses GCC's `__attribute__((ms_abi))`
   so PE code calls API functions with the correct Microsoft x64 convention
   (RCX/RDX/R8/R9) instead of SysV (RDI/RSI/RDX/RCX).
-- **Manual MS-x64 vararg extraction** — avoids the `va_list` ABI mismatch
+- **Manual MS-x64 vararg extraction**, avoids the `va_list` ABI mismatch
   between SysV and Microsoft conventions that trips up cross-ABI `printf`.
-- **GS-segment TEB** — the Windows TEB/PEB lives at `GS` on x86-64 Linux,
+- **GS-segment TEB**, the Windows TEB/PEB lives at `GS` on x86-64 Linux,
   which is free (glibc uses `FS` for its thread-local storage).
-- **RAII memory management** — `std::unique_ptr`, containers, and mutexes
+- **RAII memory management**, `std::unique_ptr`, containers, and mutexes
   replace raw pointer tracking.
 
 ## Requirements
